@@ -2,6 +2,19 @@ import streamlit as st, re, io, pandas as pd
 from PyPDF2 import PdfReader
 from openpyxl import load_workbook, Workbook
 from utils import load_profiles, cleanse_mpn
+# Безопасная загрузка профилей
+try:
+    profiles = load_profiles("supplier_profiles.yaml")
+    rules = profiles.get("default", {})
+except Exception:
+    # Фоллбэк на дефолтные правила
+    rules = {
+        "remove_leading_C_in_mpn": True,
+        "materom_mpn_before_dash": True,
+        "mpn_patterns": [r"(?i)C?(\d{2}\.\d{5}-\d{4})", r"(?i)C?(\d{8,})"],
+        "qty_patterns": [r"(?:(?:QTY|Daudz\.|Qty)\s*[:\-]?\s*)(\d+[\.,]?\d*)", r"(?:\s)(\d{1,5})\s*(?:GAB|UNID|KOM)?\b"],
+        "total_patterns": [r"(\d+[\.,]\d{2})\s*(?:EUR|€)?\s*$"],
+    }
 
 st.set_page_config(page_title="Waybill Maker", page_icon="📦", layout="wide")
 st.title("📦 Waybill Maker")
