@@ -3,3 +3,6 @@ pandas
 openpyxl
 PyYAML
 PyPDF2
+PyMuPDF
+pytesseract
+Pillow
