@@ -1,0 +1,15 @@
+# Default parsing rules
+default:
+  order_marker_regex: "(?i)\bOrder[_\s-]*(\d{4,})"
+  remove_leading_C_in_mpn: true
+  ital_express_strip_prefix: true
+  materom_mpn_before_dash: true
+  mpn_patterns:
+    - "(?i)C?(\d{2}\.\d{5}-\d{4})"
+    - "(?i)C?(\d{2}\.\d{5}-\d{3,5})"
+    - "(?i)C?(\d{8,})"
+  qty_patterns:
+    - "(?:(?:QTY|Daudz\.|Qty)\s*[:\-]?\s*)(\d+[\.,]?\d*)"
+    - "(?:\s)(\d{1,5})\s*(?:GAB|UNID|KOM)?\b"
+  total_patterns:
+    - "(\d+[\.,]\d{2})\s*(?:EUR|€)?\s*$"
