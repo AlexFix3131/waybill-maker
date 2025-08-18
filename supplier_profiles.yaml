@@ -1,22 +1,24 @@
-# Правильный профиль по умолчанию (все regex в одинарных кавычках!)
+# Универсальные правила по умолчанию (все regex в одинарных кавычках!)
 default:
-  # Маркер блока заказов (цифры из "Order_123456_*")
+  # ловим цифры из "Order_123456_*"
   order_marker_regex: '(?i)\\bOrder[_\\s-]*(\\d{4,})'
 
-  # Правила нормализации
-  remove_leading_C_in_mpn: true
-  ital_express_strip_prefix: true        # 2/XXXXXXXX -> XXXXXXXX
-  materom_mpn_before_dash: true          # 0455-XXX-YYY -> 0455
+  # нормализация
+  remove_leading_C_in_mpn: true          # C81.25101-6798 -> 81.25101-6798
+  ital_express_strip_prefix: true         # 2/XXXXXXXX -> XXXXXXXX (если нужно)
+  materom_mpn_before_dash: true           # 0455-XXX-YYY -> 0455 (если нужно)
 
-  # Паттерны для извлечения полей (идут сверху вниз)
+  # Артикулы (MPN) — сначала "81.XXXXX-YYYY", потом fallback на длинные числа
   mpn_patterns:
-    - '(?i)C?(\\d{2}\\.\\d{5}-\\d{4})'     # пример: C81.25101-6798
+    - '(?i)C?(\\d{2}\\.\\d{5}-\\d{4})'
     - '(?i)C?(\\d{2}\\.\\d{5}-\\d{3,5})'
-    - '(?i)C?(\\d{8,})'                    # просто длинные числа
+    - '(?i)C?(\\d{6,})'             # просто длинные числа (6+)
 
+  # Количество
   qty_patterns:
     - '(?:(?:QTY|Daudz\\.|Qty)\\s*[:\\-]?\\s*)(\\d+[\\.,]?\\d*)'
-    - '(?:\\s)(\\d{1,5})\\s*(?:GAB|UNID|KOM)?\\b'
+    - '(?:\\s)(\\d{1,5})\\s*(?:GAB|UNID|KOM|PCS)?\\b'
 
+  # Итого по строке
   total_patterns:
     - '(\\d+[\\.,]\\d{2})\\s*(?:EUR|€)?\\s*$'
