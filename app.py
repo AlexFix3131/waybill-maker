@@ -9,7 +9,7 @@ from utils import load_profiles, cleanse_mpn
 st.set_page_config(page_title="Waybill Maker", page_icon="📦", layout="wide")
 st.title("📦 Waybill Maker")
 
-# ========== правила (yaml -> fallback) ==========
+# ========= правила (yaml -> fallback) =========
 def load_rules_safe():
     try:
         profiles = load_profiles("supplier_profiles.yaml")
@@ -24,7 +24,7 @@ def load_rules_safe():
 RULES = load_rules_safe()
 ORDER_RE = re.compile(RULES.get("order_marker_regex", r"(?i)(?:\bOrder[_\s-]*(\d{4,})|#\s*(\d{4,}))"))
 
-# ========== утилиты ==========
+# ========= утилиты =========
 def money_to_float(x: str) -> float:
     x = x.replace(" ", "").replace("\u00A0", "")
     return round(float(x.replace(",", ".")), 2)
@@ -35,10 +35,11 @@ def qty_to_int(x: str) -> int:
 def extract_order(s: str) -> str | None:
     m = ORDER_RE.search(s)
     if m:
-        return m.group(1) or m.group(2)
+        val = (m.group(1) or m.group(2) or "").strip()
+        return val if len(val) >= 5 else None
     return None
 
-# ========== извлечение текста (PyPDF2 -> OCR) ==========
+# ========= извлечение текста (PyPDF2 -> OCR) =========
 def get_text_pages(pdf_bytes: bytes) -> list[str]:
     out = []
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -64,25 +65,23 @@ def get_text_pages(pdf_bytes: bytes) -> list[str]:
         out.append(txt)
     return out
 
-# ========== ПАРСЕР: якорь = строка с MPN ==========
+# ========= ПАРСЕР: якорь — строка с MPN =========
 def auto_parse(text_pages: list[str]) -> pd.DataFrame:
     """
-    Алгоритм:
-      1) строим список строк;
-      2) проход слева-направо: держим текущий Order;
-      3) когда встречаем строку с MPN (11 цифр ИЛИ 81.XXXXX-YYYY) — это якорь;
-      4) в окне [i-3 .. i] ищем Quantity (GAB или число прямо перед MPN) и Totalsprice
-         (последняя НЕ нулевая сумма левее MPN; если нет — просто последняя не нулевая в окне);
-      5) дедуп по (Order, MPN): оставляем с ненулевой ценой/бОльшим qty/ближе к MPN.
+    - MPN: последний 11-значный код (или 81.XXXXX-YYYY)
+    - Qty: GAB … / … GAB / число прямо перед MPN (текущая/предыдущая строка)
+    - Total: последняя НЕ нулевая денежная сумма слева от MPN; иначе в окне; игнорим совпадение с qty и значения у GAB/%
+    - Order: ближайший номер (5+ цифр) в 5 строках выше, если нет — 2 строки ниже
+    - Дедуп по (Order, MPN)
     """
-    # regex
+    # паттерны
     MPN_11   = re.compile(r"\b(\d{11})\b")
     MPN_DASH = re.compile(r"(?i)C?(\d{2}\.\d{5}-\d{3,5})")
-    MONEY    = re.compile(r"\d{1,3}(?:[\s\u00A0]?\d{3})*[.,]\d{2}")
-    GAB_A    = re.compile(r"(?i)\bGAB\b[^0-9]{0,12}(\d+[\.,]?\d*)")  # GAB … 7,00
-    GAB_B    = re.compile(r"(?i)(\d+[\.,]?\d*)\s*\bGAB\b")          # 7,00 GAB
+    MONEY    = re.compile(r"(?<!\d)(\d{1,3}(?:[ \u00A0]?\d{3})*[.,]\d{1,2})(?!\d)")  # 1–2 знака после запятой
+    GAB_A    = re.compile(r"(?i)\bGAB\b[^0-9%]{0,12}(\d+[\.,]?\d*)")  # GAB … 7,00 (без % между)
+    GAB_B    = re.compile(r"(?i)(\d+[\.,]?\d*)\s*\bGAB\b")
+    NEAR_GAB = re.compile(r"(?i)GAB|%")
 
-    # шум (банки/адреса) — чтобы не ловить мусор
     NOISE = re.compile(r"(?i)\b(IBAN|SWIFT|bank|banka|konto|account|address|adrese|PVN|VAT|invoice|rekins|rekīns|tel\.?|email)\b")
 
     # плоские строки
@@ -93,16 +92,20 @@ def auto_parse(text_pages: list[str]) -> pd.DataFrame:
             if s:
                 lines.append(s)
 
-    # индексация заказов для скорости
+    # индекс заказов
     orders_at = {}
     for i, s in enumerate(lines):
-        m = extract_order(s)
-        if m:
-            orders_at[i] = m
+        o = extract_order(s)
+        if o:
+            orders_at[i] = o
 
     def order_for_index(idx: int) -> str | None:
-        # ближайший order слева
-        for j in range(idx, -1, -1):
+        # ближ. слева в 5 строках
+        for j in range(idx, max(-1, idx-5), -1):
+            if j in orders_at:
+                return orders_at[j]
+        # если не нашли — в 2 строках ниже
+        for j in range(idx+1, min(len(lines), idx+3)):
             if j in orders_at:
                 return orders_at[j]
         return None
@@ -110,7 +113,7 @@ def auto_parse(text_pages: list[str]) -> pd.DataFrame:
     def find_mpn_in_line(s: str):
         m = list(MPN_11.finditer(s))
         if m:
-            mm = m[-1]  # самый правый
+            mm = m[-1]
             return cleanse_mpn(mm.group(1), RULES), mm.span()
         m = list(MPN_DASH.finditer(s))
         if m:
@@ -119,7 +122,7 @@ def auto_parse(text_pages: list[str]) -> pd.DataFrame:
         return None, None
 
     def find_qty(window_lines: list[str], anchor_line: str, mpn_span):
-        # 1) GAB в окне (с конца)
+        # 1) GAB в окне
         for s in reversed(window_lines):
             m = GAB_A.search(s) or GAB_B.search(s)
             if m:
@@ -136,7 +139,7 @@ def auto_parse(text_pages: list[str]) -> pd.DataFrame:
                     return qty_to_int(mpre.group(1))
                 except Exception:
                     pass
-        # 3) число в конце строки в окне (часто «… 400,00»)
+        # 3) число в конце строки в окне
         for s in reversed(window_lines):
             mpre = re.search(r"(\d{1,5})(?:[,\.]\d{1,2})?\s*$", s)
             if mpre:
@@ -146,29 +149,37 @@ def auto_parse(text_pages: list[str]) -> pd.DataFrame:
                     pass
         return 1
 
-    def find_total(window_lines: list[str], anchor_line: str, mpn_span, qty_val: int):
-        # пытаемся взять сумму ЛЕВЕЕ MPN в якорной строке — это самый надёжный вариант
+    def money_tokens(s: str):
+        return [(m.group(1), m.span(1)) for m in MONEY.finditer(s)]
+
+    def pick_total(window_lines: list[str], anchor_line: str, mpn_span, qty_val: int):
+        # 1) слева от MPN в якорной строке
         if mpn_span:
             left = anchor_line[:mpn_span[0]]
-            monies = list(MONEY.finditer(left))
-            for m in reversed(monies):  # самая правая слева от MPN
-                val = m.group(0)
+            toks = money_tokens(left)
+            for val, span in reversed(toks):
+                # игнор около GAB / %
+                near = left[max(0, span[0]-6):span[1]+6]
+                if NEAR_GAB.search(near):
+                    continue
                 try:
                     num = money_to_float(val)
                 except Exception:
                     continue
-                if num == 0:
-                    continue
-                # если число равно qty (типа 400,00 прямо перед MPN) — пропускаем
+                # игнор значений, совпадающих с qty (например 400,00)
                 if abs(num - qty_val) < 1e-9:
                     continue
-                return num
-        # иначе берём последнюю НЕ нулевую сумму в окне
+                if num != 0:
+                    return num
+        # 2) иначе — последняя НЕ нулевая сумма в окне (игнор рядом с GAB/% и равную qty)
         for s in reversed(window_lines):
-            monies = list(MONEY.finditer(s))
-            for m in reversed(monies):
+            toks = money_tokens(s)
+            for val, span in reversed(toks):
+                near = s[max(0, span[0]-6):span[1]+6]
+                if NEAR_GAB.search(near):
+                    continue
                 try:
-                    num = money_to_float(m.group(0))
+                    num = money_to_float(val)
                 except Exception:
                     continue
                 if num != 0 and abs(num - qty_val) >= 1e-9:
@@ -185,13 +196,13 @@ def auto_parse(text_pages: list[str]) -> pd.DataFrame:
         if not mpn:
             continue
 
-        # окно для контекста: три строки выше и текущая
-        win_start = max(0, i - 3)
-        window = lines[win_start:i + 1]
+        # окно: 3 строки выше + текущая
+        win_start = max(0, i-3)
+        window = lines[win_start:i+1]
 
         qty = find_qty(window, line, span)
         order = order_for_index(i)
-        total = find_total(window, line, span, qty)
+        total = pick_total(window, line, span, qty)
 
         rec = {
             "MPN": mpn,
@@ -203,14 +214,13 @@ def auto_parse(text_pages: list[str]) -> pd.DataFrame:
         }
         key = (rec["Order reference"], mpn)
 
-        # дедуп: оставляем лучшую запись
+        # дедуп: лучше — цена != 0; потом — ближе; при равенстве — больше qty
         if key in rows_by_key:
             old = rows_by_key[key]
             choose = False
             if old["Totalsprice"] == 0 and rec["Totalsprice"] != 0:
                 choose = True
             elif rec["Totalsprice"] != 0 and old["Totalsprice"] != 0:
-                # обе не ноль — берём ту, что ближе (позже)
                 if rec["_i"] >= old["_i"]:
                     choose = True
             elif rec["Totalsprice"] == old["Totalsprice"]:
@@ -228,15 +238,15 @@ def auto_parse(text_pages: list[str]) -> pd.DataFrame:
     df = df.drop(columns=["_i"], errors="ignore")
     with pd.option_context("mode.copy_on_write", True):
         df["Order reference"] = df["Order reference"].astype(str)
-    df = df.sort_values(["Order reference", "MPN"]).reset_index(drop=True)
+    df = df.sort_values(["Order reference","MPN"]).reset_index(drop=True)
     return df
 
-# ========== UI ==========
+# ========= UI =========
 pdf_file = st.file_uploader("Загрузить счёт (PDF)", type=["pdf"])
 tpl_file = st.file_uploader("Шаблон Excel (необязательно)", type=["xlsx"])
 
 if not pdf_file:
-    st.info("Загрузите PDF — нужные поля будут собраны в таблицу автоматически.")
+    st.info("Загрузите PDF — нужные поля соберутся автоматически.")
 else:
     pages_text = get_text_pages(pdf_file.read())
     df = auto_parse(pages_text)
