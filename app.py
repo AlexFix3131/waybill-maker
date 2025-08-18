@@ -101,81 +101,90 @@ def auto_parse(text_pages: list[str]) -> pd.DataFrame:
                 return val
         return None
 
-    for text in text_pages:
-        for raw in text.splitlines():
-            line = " ".join(raw.split())
-            if not line:
-                continue
+    # склеиваем переносы (окна по 3 строки)
+    flat_lines = []
+    for t in text_pages:
+        for raw in t.splitlines():
+            s = " ".join(raw.split())
+            if s:
+                flat_lines.append(s)
 
-            # Order (держим в контексте)
-            ord_num = extract_order(line)
-            if ord_num:
-                current_order = ord_num
+    windows = []
+    for i, s in enumerate(flat_lines):
+        w1 = s
+        w2 = s + " " + flat_lines[i+1] if i + 1 < len(flat_lines) else s
+        w3 = w2 + " " + flat_lines[i+2] if i + 2 < len(flat_lines) else w2
+        windows += [w1, w2, w3]
 
-            # MPN
-            mpn = find_first("mpn_patterns", line)
-            if not mpn:
-                continue
-            mpn = cleanse_mpn(mpn, rules)
+    for line in windows:
+        if not line:
+            continue
 
-            # Quantity
-            qty = find_first("qty_patterns", line, qty_to_int)
-            if qty is None:
-                # число перед MPN в конце строки
-                m_pre = re.search(r"(\d{1,5})(?:[,\.]00)?\s*"+re.escape(mpn)+r"\s*$", line)
-                if m_pre:
+        # Order
+        ord_num = extract_order(line)
+        if ord_num:
+            current_order = ord_num
+
+        # MPN
+        mpn = find_first("mpn_patterns", line)
+        if not mpn:
+            m_tail = re.search(r"(\d{8,})\s*$", line)
+            if m_tail:
+                mpn = m_tail.group(1)
+        if not mpn:
+            continue
+        mpn = cleanse_mpn(mpn, rules)
+
+        # Quantity
+        qty = find_first("qty_patterns", line, qty_to_int)
+        if qty is None:
+            m_pre = re.search(r"(\d{1,5})(?:[,\.]00)?\s*" + re.escape(mpn) + r"\s*$", line)
+            if m_pre:
+                try:
+                    qty = int(m_pre.group(1))
+                except Exception:
+                    qty = None
+        if qty is None:
+            qty = 1
+
+        # Total
+        total = find_first("total_patterns", line, money_to_float)
+        if total is None:
+            all_money = money_any_re.findall(line)
+            if all_money:
+                last = all_money[-1]
+                if last not in ("0,00", "0.00"):
                     try:
-                        qty = int(m_pre.group(1))
+                        total = money_to_float(last)
                     except Exception:
-                        qty = None
-            if qty is None:
-                qty = 1
+                        total = None
+        if total is None:
+            total = 0.0
 
-            # Totalsprice — последняя ненулевая денежная сумма в строке
-            total = find_first("total_patterns", line, money_to_float)
-            if total is None:
-                all_money = money_any_re.findall(line)
-                if all_money:
-                    last = all_money[-1]
-                    if last not in ("0,00", "0.00"):
-                        try:
-                            total = money_to_float(last)
-                        except Exception:
-                            total = None
-            if total is None:
-                total = 0.0
+        rows.append([mpn, "", qty, total, current_order or ""])
 
-            rows.append([mpn, "", qty, total, current_order or ""])
-
-    # уберём дубликаты одинаковых строк
     if rows:
         df = pd.DataFrame(rows, columns=["MPN","Replacem","Quantity","Totalsprice","Order reference"])
         df = df.drop_duplicates(subset=["MPN","Order reference","Quantity","Totalsprice"], keep="first")
         return df
     return pd.DataFrame(columns=["MPN","Replacem","Quantity","Totalsprice","Order reference"])
 
-# ---------- UI: просто загрузка и скачивание ----------
+# ---------- UI ----------
 pdf_file = st.file_uploader("Загрузить счёт (PDF)", type=["pdf"])
 tpl_file = st.file_uploader("Шаблон Excel (необязательно)", type=["xlsx"])
 
 if not pdf_file:
     st.info("Загрузите PDF-счёт. Я сам распознаю и соберу Excel по правилам.")
 else:
-    # 1) читаем и распознаём
     pages_text = get_all_text(pdf_file.read())
-
-    # 2) парсим
     df = auto_parse(pages_text)
 
-    # (необязательно) свернуть DEBUG
     with st.expander("DEBUG (распознанный текст, первые 3000 символов)", expanded=False):
         st.text("\n\n".join(pages_text)[:3000])
 
-    # 3) предпросмотр (только чтобы видеть что извлеклось)
     st.subheader("Предпросмотр (авто)")
     st.dataframe(df, use_container_width=True)
 
-    # 4) сразу формируем Excel по шаблону/дефолту
     if st.button("Скачать waybill"):
         if tpl_file:
             wb = load_workbook(tpl_file); ws = wb.active
@@ -184,7 +193,6 @@ else:
             ws["A1"] = "MPN"; ws["B1"] = "Replacem"; ws["C1"] = "Quantity"
             ws["D1"] = "Totalsprice"; ws["E1"] = "Order reference"
 
-        # очистим 2..N
         for r in range(2, 3000):
             for c in range(1, 6):
                 ws.cell(row=r, column=c, value=None)
