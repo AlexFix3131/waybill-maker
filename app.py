@@ -1,6 +1,6 @@
 import streamlit as st, re, io, pandas as pd
 from PyPDF2 import PdfReader
-import fitz  # PyMuPDF (рендер страниц в картинки для OCR)
+import fitz  # PyMuPDF (для рендера страниц в картинки)
 import pytesseract
 from PIL import Image
 from openpyxl import load_workbook, Workbook
@@ -15,7 +15,6 @@ def load_rules_safe():
         profiles = load_profiles("supplier_profiles.yaml")
         return profiles.get("default", {})
     except Exception:
-        # Фоллбэк-правила, если YAML поврежден/отсутствует
         return {
             "remove_leading_C_in_mpn": True,
             "materom_mpn_before_dash": True,
@@ -23,11 +22,11 @@ def load_rules_safe():
             "mpn_patterns": [
                 r"(?i)C?(\d{2}\.\d{5}-\d{4})",
                 r"(?i)C?(\d{2}\.\d{5}-\d{3,5})",
-                r"(?i)C?(\d{8,})",
+                r"(?i)C?(\d{6,})",
             ],
             "qty_patterns": [
                 r"(?:(?:QTY|Daudz\.|Qty)\s*[:\-]?\s*)(\d+[\.,]?\d*)",
-                r"(?:\s)(\d{1,5})\s*(?:GAB|UNID|KOM)?\b",
+                r"(?:\s)(\d{1,5})\s*(?:GAB|UNID|KOM|PCS)?\b",
             ],
             "total_patterns": [
                 r"(\d+[\.,]\d{2})\s*(?:EUR|€)?\s*$",
@@ -40,11 +39,11 @@ order_re = re.compile(rules.get("order_marker_regex", r"(?i)\bOrder[_\s-]*(\d{4,
 pdf_file = st.file_uploader("Загрузить счет (PDF)", type=["pdf"])
 tpl_file = st.file_uploader("Шаблон Excel (необязательно)", type=["xlsx"])
 
-# --- Гибридный парсер PDF: текст → при нужде OCR
+# --- Гибридный парсер PDF: сначала текст, если его мало — OCR
 def parse_pdf(pdf_bytes: bytes) -> pd.DataFrame:
     rows, current_order_digits = [], None
 
-    # 1) Пытаемся вытащить текст напрямую (PyPDF2)
+    # 1) PyPDF2: вытаскиваем "как текст"
     text_pages = []
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
@@ -54,24 +53,29 @@ def parse_pdf(pdf_bytes: bytes) -> pd.DataFrame:
         text_pages = []
 
     def too_small(pages):
-        # если на страницах почти нет текста — вероятно скан
         return not any(len(p.strip()) > 50 for p in pages)
 
-    # 2) Если текста мало — включаем OCR (PyMuPDF + Tesseract)
+    # 2) Если текста мало → OCR (PyMuPDF + Tesseract)
     if too_small(text_pages):
         text_pages = []
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        for page in doc:
-            pix = page.get_pixmap(dpi=200)
-            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            # Если установлены языковые пакеты — используем их; иначе упадём на eng
-            try:
-                ocr_txt = pytesseract.image_to_string(img, lang="eng+rus+lav")
-            except Exception:
-                ocr_txt = pytesseract.image_to_string(img, lang="eng")
-            text_pages.append(ocr_txt)
+        try:
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            for page in doc:
+                pix = page.get_pixmap(dpi=200)
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                try:
+                    ocr_txt = pytesseract.image_to_string(img, lang="eng+rus+lav")
+                except Exception:
+                    ocr_txt = pytesseract.image_to_string(img, lang="eng")
+                text_pages.append(ocr_txt)
+        except Exception as e:
+            text_pages = [f"[OCR ERROR] {e}"]
 
-    # Вспомогательная функция: найти первое совпадение по списку паттернов из YAML
+    # --- DEBUG: покажем первые 5000 символов распознанного текста
+    st.text_area("DEBUG: что удалось вытащить из PDF/OCR",
+                 "\n\n".join(text_pages)[:5000], height=240)
+
+    # Вспомогалка: первое совпадение по списку паттернов в YAML
     def find_first(pattern_key: str, line: str, conv=None):
         for patt in rules.get(pattern_key, []):
             m = re.search(patt, line)
@@ -85,10 +89,10 @@ def parse_pdf(pdf_bytes: bytes) -> pd.DataFrame:
                 return val
         return None
 
-    # 3) Разбираем построчно
+    # 3) Разбор строк
     for text in text_pages:
         for raw_line in text.splitlines():
-            line = " ".join(raw_line.split())  # нормализуем пробелы
+            line = " ".join(raw_line.split())
 
             # Смена блока заказа: Order_123456_...
             m_order = order_re.search(line)
@@ -99,13 +103,12 @@ def parse_pdf(pdf_bytes: bytes) -> pd.DataFrame:
             mpn = find_first("mpn_patterns", line)
             if not mpn:
                 continue
-            mpn = cleanse_mpn(mpn, rules)  # удаляем 'C' и пр. нормы
+            mpn = cleanse_mpn(mpn, rules)  # удаляем 'C', кастомные нормы
 
             # Quantity
             def to_int(x): return int(float(x.replace(",", ".")))
             qty = find_first("qty_patterns", line, to_int)
             if qty is None:
-                # fallback: число перед ценой в конце строки
                 m = re.search(r"\b(\d{1,4})\b.*(\d+[.,]\d{2})\s*(?:EUR|€)?\s*$", line)
                 if m:
                     qty = int(m.group(1))
@@ -133,20 +136,18 @@ if pdf_file:
     edited = st.data_editor(df, num_rows="dynamic", use_container_width=True)
 
     if st.button("Скачать waybill"):
-        # берём твой шаблон, либо создаём пустой с заголовками
+        # используем твой шаблон, либо создаём стандартный
         if tpl_file:
-            wb = load_workbook(tpl_file)
-            ws = wb.active
+            wb = load_workbook(tpl_file); ws = wb.active
         else:
-            wb = Workbook()
-            ws = wb.active
+            wb = Workbook(); ws = wb.active
             ws["A1"] = "MPN"
             ws["B1"] = "Replacem"
             ws["C1"] = "Quantity"
             ws["D1"] = "Totalsprice"
             ws["E1"] = "Order reference"
 
-        # очистка области и запись со 2-й строки
+        # очистка и запись со 2-й строки
         for r in range(2, 1000):
             for c in range(1, 6):
                 ws.cell(row=r, column=c, value=None)
@@ -155,8 +156,7 @@ if pdf_file:
             for j, value in enumerate(row, start=1):
                 ws.cell(row=i, column=j, value=value)
 
-        bio = io.BytesIO()
-        wb.save(bio)
+        bio = io.BytesIO(); wb.save(bio)
         st.download_button(
             "Скачать waybill.xlsx",
             data=bio.getvalue(),
