@@ -7,9 +7,6 @@ from openpyxl import load_workbook, Workbook
 from utils import load_profiles, cleanse_mpn
 
 st.set_page_config(page_title="Waybill Maker", page_icon="📦", layout="wide")
-# отключаем файловый watcher (устраняет inotify warning)
-st.set_option('server.fileWatcherType', 'none')
-
 st.title("📦 Waybill Maker")
 
 # --- Безопасная загрузка YAML-правил
@@ -18,6 +15,7 @@ def load_rules_safe():
         profiles = load_profiles("supplier_profiles.yaml")
         return profiles.get("default", {})
     except Exception:
+        # Фоллбэк-правила, если YAML поврежден/отсутствует
         return {
             "remove_leading_C_in_mpn": True,
             "materom_mpn_before_dash": True,
@@ -133,7 +131,7 @@ def parse_pdf(pdf_bytes: bytes) -> pd.DataFrame:
             mpn = cleanse_mpn(mpn, rules)
 
             # Quantity
-            def to_int(x): 
+            def to_int(x):
                 return int(float(x.replace(" ", "").replace(",", ".")))
             qty = find_first("qty_patterns", line, to_int)
             if qty is None:
