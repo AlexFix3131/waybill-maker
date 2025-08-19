@@ -19,9 +19,9 @@ def read_pdf_text(pdf_bytes: bytes) -> list[str]:
         pages.append(t)
     return pages
 
-# ---------- парсер под твою таблицу ----------
+# ---------- парсер ----------
 def parse_invoice(pages_text: list[str]) -> pd.DataFrame:
-    # сплющим в строки без пустых
+    # нормализуем строки
     lines: list[str] = []
     for t in pages_text:
         for s in t.splitlines():
@@ -30,21 +30,24 @@ def parse_invoice(pages_text: list[str]) -> pd.DataFrame:
                 lines.append(s)
 
     # паттерны
-    RE_MPN   = re.compile(r"\b(8\d{10})\b")             # MPN = 11 цифр, начинается с 8
-    RE_ORDER = re.compile(r"\b(1\d{5})\b")              # Order = 6 цифр, начинается с 1
-    RE_MONEY = re.compile(r"\d{1,3}(?:[ \u00A0]?\d{3})*[.,]\d{1,2}")  # 1 234,56  |  1234.56
-    RE_GAB1  = re.compile(r"(?i)\bGAB\b[^\d%\-]{0,6}(\d+)")
-    RE_GAB2  = re.compile(r"(?i)(\d+)\s*\bGAB\b")
+    RE_MPN    = re.compile(r"\b(8\d{10})\b")               # 11 цифр, начинается с 8
+    RE_ORDER  = re.compile(r"\b(1\d{5})\b")                # 6 цифр, начинается с 1
+    RE_MONEY  = re.compile(r"\d{1,3}(?:[ \u00A0]?\d{3})*[.,]\d{1,2}")  # 1 234,56 / 1234.56
+    # qty — строго денежный формат рядом с GAB, НЕ рядом с %
+    RE_QTY_TOKEN = re.compile(r"(?<!\d)\d{1,4}[.,]\d{2}(?!\d)")
 
-    current_order: str | None = None
-    rows = []
+    def to_float(tok: str) -> float:
+        return float(tok.replace(" ", "").replace("\u00A0", "").replace(",", "."))
+
+    def to_int_qty(tok: str) -> int:
+        return int(round(to_float(tok)))
 
     def last_money(s: str) -> str | None:
         toks = RE_MONEY.findall(s)
         return toks[-1] if toks else None
 
-    def norm_qty_token(tok: str) -> int:
-        return int(float(tok.replace(" ", "").replace(",", ".").replace("\u00A0", "")))
+    current_order: str | None = None
+    rows = []
 
     for i, line in enumerate(lines):
         # обновляем order (берём ближайший сверху)
@@ -52,39 +55,76 @@ def parse_invoice(pages_text: list[str]) -> pd.DataFrame:
         if m_ord:
             current_order = m_ord.group(1)
 
-        # якорь — строка с MPN
         m_mpn = RE_MPN.search(line)
         if not m_mpn:
             continue
         mpn = m_mpn.group(1)
 
-        # ---- qty (рядом с GAB) ----
+        # -------- QTY рядом с GAB --------
         qty = None
-        for look in (line, lines[i-1] if i > 0 else "", lines[i+1] if i+1 < len(lines) else ""):
-            if not look:
-                continue
-            m = RE_GAB1.search(look) or RE_GAB2.search(look)
-            if m:
-                try:
-                    qty = int(m.group(1))
-                    break
-                except Exception:
-                    pass
-        if qty is None:
-            qty = 0  # если не нашли GAB — пусть будет 0, чтобы ты это видел
+        # пробуем в текущей строке
+        def pick_qty_from_string(s: str) -> int | None:
+            if not s:
+                return None
+            s_low = s.lower()
+            pos = s_low.find("gab")
+            if pos == -1:
+                return None
+            # окно вокруг GAB
+            window_left  = max(0, pos - 30)
+            window_right = min(len(s), pos + 30)
+            window = s[window_left:window_right]
 
-        # ---- total (последняя сумма в строке, если нет — в следующей) ----
+            # исключаем проценты (например 58%)
+            if "%" in window:
+                # но проценты могут быть отдельно; мы всё равно фильтруем токены
+                pass
+
+            # ищем денежные токены в окне
+            cands = list(RE_QTY_TOKEN.finditer(window))
+            if not cands:
+                return None
+            # берём ближайший к GAB: минимальная дистанция от индекса pos
+            best_tok = None
+            best_dist = None
+            for m in cands:
+                if "%" in window[max(0, m.start()-2): m.end()+2]:
+                    continue
+                dist = min(abs((window_left + m.start()) - pos),
+                           abs((window_left + m.end())   - pos))
+                if best_dist is None or dist < best_dist:
+                    best_dist = dist
+                    best_tok = m.group(0)
+            if best_tok:
+                try:
+                    return to_int_qty(best_tok)
+                except Exception:
+                    return None
+            return None
+
+        qty = pick_qty_from_string(line)
+        if qty is None and i+1 < len(lines):
+            qty = pick_qty_from_string(lines[i+1])
+        if qty is None and i > 0:
+            qty = pick_qty_from_string(lines[i-1])
+        if qty is None:
+            qty = 0
+
+        # -------- TOTAL (последняя денежная сумма в строке; если путается с qty, берём предыдущую) --------
         total_tok = last_money(line)
         if not total_tok and i + 1 < len(lines):
             total_tok = last_money(lines[i + 1])
 
-        # защита от путаницы с qty: не берём ...,"400,00" если qty == 400
         if total_tok:
             try:
-                if abs(norm_qty_token(total_tok) - qty) == 0 and len(RE_MONEY.findall(line)) > 1:
-                    # берём предпоследнюю сумму (обычно "Cena"), последняя будет "Summa"
+                # если total совпал с qty (например 400,00) и в строке есть ещё суммы — попробуем взять предыдущую
+                if abs(to_int_qty(total_tok) - qty) == 0:
                     toks = RE_MONEY.findall(line)
-                    total_tok = toks[-1] if toks[-1] != f"{qty},00" else toks[-2]
+                    if len(toks) >= 2 and toks[-1] == total_tok:
+                        # предпочитаем предпоследнюю ТОЛЬКО если она не равна qty
+                        prev_tok = toks[-2]
+                        if abs(to_int_qty(prev_tok) - qty) != 0:
+                            total_tok = prev_tok
             except Exception:
                 pass
 
@@ -98,12 +138,13 @@ def parse_invoice(pages_text: list[str]) -> pd.DataFrame:
             "Order reference": current_order or ""
         })
 
-    # уникальность по (Order, MPN) и порядок
-    df = pd.DataFrame(rows)
-    if df.empty:
+    if not rows:
         return pd.DataFrame(columns=["MPN","Replacem","Quantity","Totalsprice","Order reference"])
-    df = df.drop_duplicates(subset=["Order reference", "MPN"], keep="last")
-    df = df.sort_values(["Order reference", "MPN"]).reset_index(drop=True)
+
+    df = pd.DataFrame(rows)
+    # уникальность по (Order, MPN), порядок
+    df = df.drop_duplicates(subset=["Order reference","MPN"], keep="last")
+    df = df.sort_values(["Order reference","MPN"]).reset_index(drop=True)
     return df
 
 # ---------- UI ----------
@@ -132,4 +173,4 @@ if pdf_file:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 else:
-    st.info("1) Залей PDF\n2) Проверяй предпросмотр\n3) Жми «Скачать Excel»")
+    st.info("1) Залей PDF → 2) проверь предпросмотр → 3) «Скачать Excel».")
