@@ -8,23 +8,30 @@ import pandas as pd
 import streamlit as st
 from openpyxl import Workbook, load_workbook
 
+# ---------------- UI ----------------
 st.set_page_config(page_title="Waybill Maker", page_icon="📦", layout="wide")
 st.title("📦 Waybill Maker")
 
-# ===== RegEx =====
-RE_MPN     = re.compile(r"\b(8\d{10})\b")
-RE_ORDER   = re.compile(r"(?:#\s*)?(1\d{5})\b")
-RE_MONEY   = re.compile(r"\d{1,3}(?:[ \u00A0]?\d{3})*[.,]\d{2}")     # 1 234,56 | 1234.56
-RE_DEC     = re.compile(r"^\d{1,5}[.,]\d{2}$")                       # 7,00 | 400,00
-RE_HEADER1 = re.compile(r"(?i)artik|artikul")                        # Artikuls (латыш)
-RE_HEADER2 = re.compile(r"(?i)daudz")                                # Daudz.
-RE_HEADER3 = re.compile(r"(?i)summa|summ")                           # Summa
+# ---------------- Regex ----------------
+RE_MPN      = re.compile(r"\b(8\d{10})\b")                                  # 11 цифр, начинается с 8
+RE_MONEY    = re.compile(r"\d{1,3}(?:[ \u00A0]?\d{3})*[.,]\d{2}")           # 1 234,56 | 1234.56
+RE_DEC      = re.compile(r"^\d{1,6}[.,]\d{2}$")                             # 7,00 | 400,00
+RE_HDR_ART  = re.compile(r"(?i)artik|artikul")                              # Artikuls
+RE_HDR_QTY  = re.compile(r"(?i)daudz")                                      # Daudz.
+RE_HDR_SUM  = re.compile(r"(?i)summa|summ")                                 # Summa
 
-def f_to_float(tok: str) -> float:
+# «умные» шаблоны заказа (берём чистые 6 цифр начиная с 1):
+RE_ORDER_PATTERNS = [
+    re.compile(r"(?:^|\s)#\s*(1\d{5})(?:\s|$)"),                            # #125576
+    re.compile(r"(?i)order[_\-\s]*0*(1\d{5})"),                             # Order_125867_31.07.25 → 125867
+    re.compile(r"(?<![\d.,])(1\d{5})(?![\d.,])"),                           # отдельно стоящее 1xxxxx без пунктуации
+]
+
+def to_float(tok: str) -> float:
     return float(tok.replace(" ", "").replace("\u00A0", "").replace(",", "."))
 
-def f_to_int(tok: str) -> int:
-    return int(round(f_to_float(tok)))
+def to_int(tok: str) -> int:
+    return int(round(to_float(tok)))
 
 @dataclass
 class Word:
@@ -40,12 +47,12 @@ class ColumnBand:
     x_left: float
     x_right: float
 
-# ---------- PDF helpers ----------
+# ---------------- PDF helpers ----------------
 def load_words_per_page(pdf_bytes: bytes) -> List[List[Word]]:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     pages_words: List[List[Word]] = []
     for p in doc:
-        words = p.get_text("words")  # (x0,y0,x1,y1, text, block, line, word_no)
+        words = p.get_text("words")  # x0,y0,x1,y1,text,block,line,word_no
         ws = [Word(w[0], w[1], w[2], w[3], w[4]) for w in words]
         ws.sort(key=lambda w: (round(w.y0, 1), w.x0))
         pages_words.append(ws)
@@ -70,148 +77,161 @@ def group_lines(words: List[Word], y_tol: float = 1.2) -> List[List[Word]]:
 
 def find_header_bands(lines: List[List[Word]]) -> Optional[List[ColumnBand]]:
     """
-    Ищем строку‑шапку, где есть Artikuls / Daudz. / Summa.
-    Строим 3 окна‑колонки, делим по серединам между центрами слов.
+    Ищем строку-шапку (Artikuls / Daudz. / Summa), строим окна колонок по X.
     """
-    for ln in lines[:40]:  # в верхней части страницы
-        texts = " ".join(w.text for w in ln)
-        has_art = RE_HEADER1.search(texts) is not None
-        has_dau = RE_HEADER2.search(texts) is not None
-        has_sum = RE_HEADER3.search(texts) is not None
-        if has_art and has_dau and has_sum:
-            # возьмём центры слов-меток
-            def center_of(pattern):
-                cand = [((w.x0 + w.x1) / 2.0) for w in ln if pattern.search(w.text)]
-                return sum(cand) / len(cand) if cand else None
-
-            cx_art = center_of(RE_HEADER1)
-            cx_dau = center_of(RE_HEADER2)
-            cx_sum = center_of(RE_HEADER3)
-            centers = [("Artikuls", cx_art), ("Daudz.", cx_dau), ("Summa", cx_sum)]
+    for ln in lines[:50]:
+        line_text = " ".join(w.text for w in ln)
+        if RE_HDR_ART.search(line_text) and RE_HDR_QTY.search(line_text) and RE_HDR_SUM.search(line_text):
+            # центры меток
+            def center(pattern):
+                xs = [ (w.x0+w.x1)/2 for w in ln if pattern.search(w.text) ]
+                return sum(xs)/len(xs) if xs else None
+            cx_art = center(RE_HDR_ART)
+            cx_qty = center(RE_HDR_QTY)
+            cx_sum = center(RE_HDR_SUM)
+            centers = [("Artikuls", cx_art), ("Daudz.", cx_qty), ("Summa", cx_sum)]
             centers = [(n, c) for n, c in centers if c is not None]
-            if len(centers) < 2:
-                continue
             centers.sort(key=lambda t: t[1])
-            # границы — середины между соседями
+            if len(centers) < 2:  # слабая шапка
+                break
+            # границы — середины между центрами
             bands: List[ColumnBand] = []
             for i, (name, cx) in enumerate(centers):
-                if i == 0:
-                    left = cx - 60  # чуть шире слева
-                else:
-                    left = (centers[i - 1][1] + cx) / 2
-                if i == len(centers) - 1:
-                    right = cx + 120  # правую расширим (Summa)
-                else:
-                    right = (cx + centers[i + 1][1]) / 2
+                left = (centers[i-1][1] + cx)/2 if i>0 else cx - 70
+                right = (cx + centers[i+1][1])/2 if i < len(centers)-1 else cx + 140
                 bands.append(ColumnBand(name, left, right))
-            # Убедимся, что есть все 3 (если нет, дополним разумно)
-            names = {b.name for b in bands}
-            if "Artikuls" not in names or "Daudz." not in names or "Summa" not in names:
-                # попытаемся «назвать» по позициям: слева → Artikuls, середина → Daudz., справа → Summa
-                bands.sort(key=lambda b: b.x_left)
-                alias = ["Artikuls", "Daudz.", "Summa"]
-                for b, nm in zip(bands[:3], alias):
-                    b.name = nm
+            # приведём к фиксированным именам по позиции
+            bands.sort(key=lambda b: b.x_left)
+            for b, nm in zip(bands, ["Artikuls","Daudz.","Summa"]):
+                b.name = nm
             return bands
     return None
 
 def words_in_band(line: List[Word], band: ColumnBand) -> List[Word]:
-    return [w for w in line if (w.x0 + w.x1) / 2.0 >= band.x_left and (w.x0 + w.x1) / 2.0 <= band.x_right]
+    return [w for w in line if (w.x0 + w.x1)/2 >= band.x_left and (w.x0 + w.x1)/2 <= band.x_right]
 
-# ---------- Core extraction ----------
+# ---------------- Order detection ----------------
+def extract_order_from_text(text: str) -> Optional[str]:
+    for pat in RE_ORDER_PATTERNS:
+        m = pat.search(text)
+        if m:
+            return m.group(1)
+    return None
+
+def find_order_for_line(lines_text: List[str], i: int, lookback: int = 10) -> str:
+    """
+    Для строки i ищем ПОСЛЕДНЕЕ упоминание заказа в окне [i-lookback, i-1].
+    Если не нашли — смотрим строку ниже (i+1).
+    """
+    start = max(0, i - lookback)
+    for j in range(i-1, start-1, -1):
+        o = extract_order_from_text(lines_text[j])
+        if o:
+            return o
+    if i + 1 < len(lines_text):
+        o = extract_order_from_text(lines_text[i+1])
+        if o:
+            return o
+    return ""
+
+# ---------------- Core extraction ----------------
 def parse_pdf_to_df(pdf_bytes: bytes) -> pd.DataFrame:
     pages = load_words_per_page(pdf_bytes)
-    out_rows = []
+    out = []
 
     for page_words in pages:
         lines = group_lines(page_words)
+        lines_text = [" ".join(w.text for w in ln) for ln in lines]
+
         bands = find_header_bands(lines)
-        current_order = ""  # «текущий» заказ сверху
-
-        # если шапку не нашли — всё равно попробуем простую эвристику
         if not bands:
-            # fallback: разделим на 3 равные полосы по ширине страницы
-            if not page_words:
-                continue
-            x_min = min(w.x0 for w in page_words)
-            x_max = max(w.x1 for w in page_words)
-            w = (x_max - x_min) / 3
-            bands = [
-                ColumnBand("Artikuls", x_min - 10, x_min + w),
-                ColumnBand("Daudz.",  x_min + w, x_min + 2*w),
-                ColumnBand("Summa",   x_min + 2*w, x_max + 20),
-            ]
+            # без шапки — откажемся, чтобы не плодить ошибки
+            continue
+        band_map = {b.name: b for b in bands}
 
-        # идём по строкам после шапки
+        # после шапки начинаем собирать товары
         start_collect = False
-        for ln in lines:
-            txt_line = " ".join(w.text for w in ln)
-            # обновление order если встречается
-            mo = RE_ORDER.search(txt_line)
-            if mo:
-                current_order = mo.group(1)
+        for i, ln in enumerate(lines):
+            txt = lines_text[i]
 
-            # включаем сбор после строки шапки
             if not start_collect:
-                if (RE_HEADER1.search(txt_line) and RE_HEADER2.search(txt_line) and RE_HEADER3.search(txt_line)):
+                if (RE_HDR_ART.search(txt) and RE_HDR_QTY.search(txt) and RE_HDR_SUM.search(txt)):
                     start_collect = True
                 continue
 
-            # из полос берём данные
-            band_map = {b.name: words_in_band(ln, b) for b in bands}
-            # MPN — ищем 11‑значный на 8 в колонке Artikuls
+            # в колонке Artikuls ищем MPN
             mpn = None
-            for w in band_map.get("Artikuls", []):
+            for w in words_in_band(ln, band_map["Artikuls"]):
                 m = RE_MPN.search(w.text)
                 if m:
                     mpn = m.group(1); break
             if not mpn:
-                # fallback: во всей строке
-                m = RE_MPN.search(txt_line)
-                if m:
-                    mpn = m.group(1)
-            if not mpn:
-                continue  # строка без артикула нам не интересна
+                # fallback: во всей строке (иногда номер клеят левее/правее)
+                m = RE_MPN.search(txt)
+                if not m:
+                    continue
+                mpn = m.group(1)
 
-            # Qty — токен формата 7,00/400,00 в колонке Daudz.
+            # qty из Daudz.: первый "7,00/400,00"
             qty = 0
-            for w in band_map.get("Daudz.", []):
+            band_qty_words = words_in_band(ln, band_map["Daudz."])
+            if not band_qty_words and i+1 < len(lines):
+                band_qty_words = words_in_band(lines[i+1], band_map["Daudz."])
+            for w in band_qty_words:
                 if RE_DEC.match(w.text):
-                    qty = f_to_int(w.text)
-                    break
+                    qty = to_int(w.text); break
 
-            # Total — самый правый денежный в колонке Summa
+            # total из Summa: самый правый денежный токен в окне
+            totals_words = words_in_band(ln, band_map["Summa"])
+            money = [(w.x0, w.text) for w in totals_words if RE_MONEY.fullmatch(w.text)]
+            if not money and i+1 < len(lines):
+                totals_words2 = words_in_band(lines[i+1], band_map["Summa"])
+                money = [(w.x0, w.text) for w in totals_words2 if RE_MONEY.fullmatch(w.text)]
             total_tok = None
-            sums = [(w.x0, w.text) for w in band_map.get("Summa", []) if RE_MONEY.fullmatch(w.text)]
-            if sums:
-                sums.sort(key=lambda t: t[0])
-                total_tok = sums[-1][1]
-            # если пусто — попробуем правые токены во всей строке
+            if money:
+                money.sort(key=lambda t: t[0])
+                total_tok = money[-1][1]
             if not total_tok:
-                sums2 = [(w.x0, w.text) for w in ln if RE_MONEY.fullmatch(w.text)]
-                if sums2:
-                    sums2.sort(key=lambda t: t[0]); total_tok = sums2[-1][1]
+                # крайний правый денежный по всей строке
+                money2 = [(w.x0, w.text) for w in ln if RE_MONEY.fullmatch(w.text)]
+                if money2:
+                    money2.sort(key=lambda t: t[0])
+                    total_tok = money2[-1][1]
             total = total_tok or "0,00"
 
-            out_rows.append({
+            # если total = "400,00" и совпало с qty (400) — попробуем взять предпредпоследнюю сумму в колонке
+            if total_tok and qty:
+                try:
+                    if abs(to_int(total_tok) - qty) == 0:
+                        mm = [(w.x0, w.text) for w in totals_words if RE_MONEY.fullmatch(w.text)]
+                        if len(mm) >= 2:
+                            mm.sort(key=lambda t: t[0])
+                            alt = mm[-2][1]
+                            if abs(to_int(alt) - qty) != 0:
+                                total = alt
+                except Exception:
+                    pass
+
+            # order — последний вверх по окну
+            order = find_order_for_line(lines_text, i, lookback=10)
+
+            out.append({
                 "MPN": mpn,
                 "Replacem": "",
                 "Quantity": qty,
                 "Totalsprice": total,
-                "Order reference": current_order
+                "Order reference": order
             })
 
-    if not out_rows:
+    if not out:
         return pd.DataFrame(columns=["MPN","Replacem","Quantity","Totalsprice","Order reference"])
 
-    df = pd.DataFrame(out_rows)
-    # чистим дубли по (Order, MPN)
-    df = df.drop_duplicates(subset=["Order reference", "MPN"], keep="last")
-    # финальный вид и порядок
-    df = df[["MPN", "Replacem", "Quantity", "Totalsprice", "Order reference"]]
-    return df.reset_index(drop=True)
+    df = pd.DataFrame(out)
+    df = df.drop_duplicates(subset=["Order reference","MPN"], keep="last")
+    df = df.sort_values(["Order reference","MPN"]).reset_index(drop=True)
+    return df
 
-# ---------- UI ----------
+# ---------------- UI flow ----------------
 pdf_file = st.file_uploader("Загрузить PDF-счёт", type=["pdf"])
 tpl_file = st.file_uploader("Шаблон Excel (необязательно)", type=["xlsx"])
 
@@ -239,6 +259,7 @@ if pdf_file:
         )
 else:
     st.info(
-        "Алгоритм: ищем шапку (Artikuls/Daudz./Summa), строим окна колонок по X, "
-        "а затем берём MPN/Daudz/Summa только из своих окон; Order — ближайший #1xxxxx."
+        "Мы парсим PDF по координатам: шапка → окна колонок; "
+        "MPN — в Artikuls, Qty — токен вида 7,00 в Daudz., Summa — крайняя справа сумма в Summa; "
+        "Order — последний #1xxxxx/Order_1xxxxx выше позиции."
     )
