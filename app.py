@@ -1,5 +1,6 @@
 import io
 import re
+import statistics
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
 
@@ -7,7 +8,6 @@ import fitz  # PyMuPDF
 import pandas as pd
 import streamlit as st
 from openpyxl import Workbook, load_workbook
-import statistics
 
 # ---------------- UI ----------------
 st.set_page_config(page_title="Waybill Maker", page_icon="📦", layout="wide")
@@ -21,10 +21,10 @@ RE_HDR_ART  = re.compile(r"(?i)artik|artikul")                              # Ar
 RE_HDR_QTY  = re.compile(r"(?i)daudz")                                      # Daudz.
 RE_HDR_SUM  = re.compile(r"(?i)summa|summ")                                 # Summa
 
-# Заказ: поддерживаем и #125576, и Order_125867_31.07.25, и просто 125450 без пунктуации.
+# Заказ: и #125576, и Order_125867_..., и просто 125450 без пунктуации
 RE_ORDER_PATTERNS = [
     re.compile(r"(?:^|\s)#\s*(1\d{5})(?:\s|$)"),
-    re.compile(r"(?i)\border[_\-\s]*0*(1\d{5})"),                           # Order_125867_31.07.25 → 125867
+    re.compile(r"(?i)\border[_\-\s]*0*(1\d{5})"),
     re.compile(r"(?<![\d.,])(1\d{5})(?![\d.,])"),
 ]
 
@@ -163,21 +163,16 @@ def detect_order_markers(page_words: List[Word]) -> List[OrderMarker]:
     if not markers:
         return []
 
-    # ищем «вертикальную колонку» по X — медиана и фильтр по радиусу
     xs = [m.x for m in markers]
     x_med = statistics.median(xs)
-    # радиус — 35px (достаточно узкая колонка в счёте)
-    filtered = [m for m in markers if abs(m.x - x_med) <= 35]
+    filtered = [m for m in markers if abs(m.x - x_med) <= 35]  # узкая колонка
     if len(filtered) >= max(3, len(markers)//2):
-        markers = filtered  # удалось найти явную колонку
+        markers = filtered
 
     markers.sort(key=lambda m: m.y)
     return markers
 
 def find_order_for_line_via_column(markers: List[OrderMarker], line_y: float) -> Optional[str]:
-    """
-    Берём маркер с максимальным y <= line_y+2px; если нет — ближайший в окне ±30px.
-    """
     if not markers:
         return None
     below = [m for m in markers if m.y <= line_y + 2]
@@ -192,14 +187,20 @@ def find_order_for_block_fallback(lines_text: List[str], i_start: int, i_end: in
     # вверх
     start = max(0, i_start - 15)
     for j in range(i_start-1, start-1, -1):
-        o = extract_order_from_text(lines_text[j]);  if o: return o
+        o = extract_order_from_text(lines_text[j])
+        if o:
+            return o
     # внутри
     for j in range(i_start, i_end+1):
-        o = extract_order_from_text(lines_text[j]);  if o: return o
+        o = extract_order_from_text(lines_text[j])
+        if o:
+            return o
     # вниз
     down_end = min(len(lines_text)-1, i_end + 10)
     for j in range(i_end+1, down_end+1):
-        o = extract_order_from_text(lines_text[j]);  if o: return o
+        o = extract_order_from_text(lines_text[j])
+        if o:
+            return o
     return ""
 
 # ---------------- Core extraction ----------------
@@ -216,10 +217,10 @@ def parse_pdf_to_df(pdf_bytes: bytes) -> pd.DataFrame:
         prev_bands = bands
         band_map = {b.name: b for b in bands}
 
-        # *** новая мощная привязка заказов по «вертикальной колонке» ***
+        # Колонка заказов
         order_markers = detect_order_markers(page_words)
 
-        # индексы строк с MPN (якоря блоков)
+        # Якоря блоков (MPN)
         mpn_idxs: List[int] = []
         for idx, ln in enumerate(lines):
             ln_art = words_in_band(ln, band_map["Artikuls"])
@@ -239,7 +240,7 @@ def parse_pdf_to_df(pdf_bytes: bytes) -> pd.DataFrame:
                 continue
             mpn = m.group(1)
 
-            # --- ORDER (сначала через колонку, потом fallback) ---
+            # --- ORDER ---
             line_y = statistics.fmean([w.y0 for w in lines[i_start]]) if lines[i_start] else 0.0
             order = find_order_for_line_via_column(order_markers, line_y) or \
                     find_order_for_block_fallback(lines_text, i_start, i_end)
@@ -304,7 +305,6 @@ def parse_pdf_to_df(pdf_bytes: bytes) -> pd.DataFrame:
 
             total_str = fmt_money(total_tok)
 
-            # защита от совпадения total == qty (например 400,00)
             try:
                 if total_tok and abs(to_int(total_tok) - qty) == 0 and len(money) >= 2:
                     alt = money[-2][1]
@@ -358,7 +358,6 @@ if pdf_file:
         )
 else:
     st.info(
-        "Order № теперь ловится по «вертикальной колонке» на странице (по X‑координате) "
-        "и привязывается к ближайшей ниже позиции. Если колонки нет — fallback-поиск вверх/внутри/вниз. "
+        "Order № ловится по «вертикальной колонке» (по X) и по fallback‑поиску. "
         "Qty — колонка Daudz., Total — крайняя справа сумма в Summa."
     )
