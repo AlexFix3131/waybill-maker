@@ -7,6 +7,7 @@ import fitz  # PyMuPDF
 import pandas as pd
 import streamlit as st
 from openpyxl import Workbook, load_workbook
+import statistics
 
 # ---------------- UI ----------------
 st.set_page_config(page_title="Waybill Maker", page_icon="📦", layout="wide")
@@ -23,7 +24,7 @@ RE_HDR_SUM  = re.compile(r"(?i)summa|summ")                                 # Su
 # Заказ: поддерживаем и #125576, и Order_125867_31.07.25, и просто 125450 без пунктуации.
 RE_ORDER_PATTERNS = [
     re.compile(r"(?:^|\s)#\s*(1\d{5})(?:\s|$)"),
-    re.compile(r"(?i)order[_\-\s]*0*(1\d{5})"),
+    re.compile(r"(?i)\border[_\-\s]*0*(1\d{5})"),                           # Order_125867_31.07.25 → 125867
     re.compile(r"(?<![\d.,])(1\d{5})(?![\d.,])"),
 ]
 
@@ -33,10 +34,10 @@ def to_float(tok: str) -> float:
 def to_int(tok: str) -> int:
     return int(round(to_float(tok)))
 
-def fmt_money(tok: str) -> str:
-    # нормализуем формат: используем исходный токен если он уже с запятой
+def fmt_money(tok: Optional[str]) -> str:
+    if not tok:
+        return "0,00"
     t = tok.replace("\u00A0", " ").strip()
-    # если точка как запятая — преобразуем
     if "." in t and "," not in t:
         try:
             return f"{to_float(t):.2f}".replace(".", ",")
@@ -87,13 +88,9 @@ def group_lines(words: List[Word], y_tol: float = 1.2) -> List[List[Word]]:
     return lines
 
 def find_header_bands(lines: List[List[Word]]) -> Optional[List[ColumnBand]]:
-    """
-    Ищем строку-шапку (Artikuls / Daudz. / Summa), строим окна колонок по X.
-    """
     for ln in lines[:60]:
         text = " ".join(w.text for w in ln)
         if RE_HDR_ART.search(text) and RE_HDR_QTY.search(text) and RE_HDR_SUM.search(text):
-            # центры меток
             def center(pattern):
                 xs = [ (w.x0+w.x1)/2 for w in ln if pattern.search(w.text) ]
                 return sum(xs)/len(xs) if xs else None
@@ -105,13 +102,11 @@ def find_header_bands(lines: List[List[Word]]) -> Optional[List[ColumnBand]]:
             centers.sort(key=lambda t: t[1])
             if len(centers) < 2:
                 break
-            # границы — середины между центрами
             bands: List[ColumnBand] = []
             for i, (name, cx) in enumerate(centers):
                 left = (centers[i-1][1] + cx)/2 if i>0 else cx - 80
                 right = (cx + centers[i+1][1])/2 if i < len(centers)-1 else cx + 160
                 bands.append(ColumnBand(name, left, right))
-            # жёстко переименуем по позициям (слева→справа)
             bands.sort(key=lambda b: b.x_left)
             for b, nm in zip(bands, ["Artikuls","Daudz.","Summa"]):
                 b.name = nm
@@ -119,7 +114,6 @@ def find_header_bands(lines: List[List[Word]]) -> Optional[List[ColumnBand]]:
     return None
 
 def fallback_bands(page_words: List[Word]) -> List[ColumnBand]:
-    """Если шапка не найдена: строим окна колонок по ширине страницы."""
     if not page_words:
         return [
             ColumnBand("Artikuls", 0, 200),
@@ -129,7 +123,6 @@ def fallback_bands(page_words: List[Word]) -> List[ColumnBand]:
     x_min = min(w.x0 for w in page_words)
     x_max = max(w.x1 for w in page_words)
     W = x_max - x_min
-    # 45% / 20% / 35%
     a_r = x_min + 0.45 * W
     d_r = x_min + 0.65 * W
     return [
@@ -149,30 +142,64 @@ def extract_order_from_text(text: str) -> Optional[str]:
             return m.group(1)
     return None
 
-def find_order_for_block(lines_text: List[str], i_start: int, i_end: int) -> str:
+@dataclass
+class OrderMarker:
+    x: float
+    y: float
+    value: str
+
+def detect_order_markers(page_words: List[Word]) -> List[OrderMarker]:
+    markers: List[OrderMarker] = []
+    for w in page_words:
+        val = None
+        for pat in RE_ORDER_PATTERNS:
+            m = pat.search(w.text)
+            if m:
+                val = m.group(1); break
+        if val:
+            cx = (w.x0 + w.x1)/2
+            cy = (w.y0 + w.y1)/2
+            markers.append(OrderMarker(cx, cy, val))
+    if not markers:
+        return []
+
+    # ищем «вертикальную колонку» по X — медиана и фильтр по радиусу
+    xs = [m.x for m in markers]
+    x_med = statistics.median(xs)
+    # радиус — 35px (достаточно узкая колонка в счёте)
+    filtered = [m for m in markers if abs(m.x - x_med) <= 35]
+    if len(filtered) >= max(3, len(markers)//2):
+        markers = filtered  # удалось найти явную колонку
+
+    markers.sort(key=lambda m: m.y)
+    return markers
+
+def find_order_for_line_via_column(markers: List[OrderMarker], line_y: float) -> Optional[str]:
     """
-    Для блока [i_start, i_end] берём ПОСЛЕДНЕЕ упоминание заказа:
-    1) в 15 строках вверх от i_start,
-    2) внутри самого блока,
-    3) в 10 строках вниз от i_end.
+    Берём маркер с максимальным y <= line_y+2px; если нет — ближайший в окне ±30px.
     """
+    if not markers:
+        return None
+    below = [m for m in markers if m.y <= line_y + 2]
+    if below:
+        return below[-1].value
+    near = sorted(markers, key=lambda m: abs(m.y - line_y))
+    if near and abs(near[0].y - line_y) <= 30:
+        return near[0].value
+    return None
+
+def find_order_for_block_fallback(lines_text: List[str], i_start: int, i_end: int) -> str:
     # вверх
     start = max(0, i_start - 15)
     for j in range(i_start-1, start-1, -1):
-        o = extract_order_from_text(lines_text[j])
-        if o:
-            return o
-    # внутри блока (справа бывает заголовок Order)
+        o = extract_order_from_text(lines_text[j]);  if o: return o
+    # внутри
     for j in range(i_start, i_end+1):
-        o = extract_order_from_text(lines_text[j])
-        if o:
-            return o
+        o = extract_order_from_text(lines_text[j]);  if o: return o
     # вниз
     down_end = min(len(lines_text)-1, i_end + 10)
     for j in range(i_end+1, down_end+1):
-        o = extract_order_from_text(lines_text[j])
-        if o:
-            return o
+        o = extract_order_from_text(lines_text[j]);  if o: return o
     return ""
 
 # ---------------- Core extraction ----------------
@@ -185,60 +212,54 @@ def parse_pdf_to_df(pdf_bytes: bytes) -> pd.DataFrame:
         lines = group_lines(page_words)
         lines_text = [" ".join(w.text for w in ln) for ln in lines]
 
-        bands = find_header_bands(lines)
-        if not bands:
-            bands = prev_bands or fallback_bands(page_words)
-        prev_bands = bands  # запоминаем для следующей страницы
-
+        bands = find_header_bands(lines) or prev_bands or fallback_bands(page_words)
+        prev_bands = bands
         band_map = {b.name: b for b in bands}
 
-        # найдём индексы строк с MPN (якорь блока)
+        # *** новая мощная привязка заказов по «вертикальной колонке» ***
+        order_markers = detect_order_markers(page_words)
+
+        # индексы строк с MPN (якоря блоков)
         mpn_idxs: List[int] = []
         for idx, ln in enumerate(lines):
-            # сначала возвращаемся к колонке "Artikuls"
             ln_art = words_in_band(ln, band_map["Artikuls"])
-            joined_art = " ".join(w.text for w in ln_art) if ln_art else ""
-            m = RE_MPN.search(joined_art) or RE_MPN.search(lines_text[idx])
+            m = RE_MPN.search(" ".join(w.text for w in ln_art)) or RE_MPN.search(lines_text[idx])
             if m:
                 mpn_idxs.append(idx)
 
-        # строим блоки между MPN
         for k, i_start in enumerate(mpn_idxs):
             i_end = (mpn_idxs[k+1] - 1) if k+1 < len(mpn_idxs) else (len(lines) - 1)
+
             # --- MPN ---
             m = RE_MPN.search(lines_text[i_start])
             if not m:
-                # на всякий случай ищем только в artikuls‑окне
                 ln_art = words_in_band(lines[i_start], band_map["Artikuls"])
                 m = RE_MPN.search(" ".join(w.text for w in ln_art))
             if not m:
                 continue
             mpn = m.group(1)
 
-            # --- ORDER ---
-            order = find_order_for_block(lines_text, i_start, i_end)
+            # --- ORDER (сначала через колонку, потом fallback) ---
+            line_y = statistics.fmean([w.y0 for w in lines[i_start]]) if lines[i_start] else 0.0
+            order = find_order_for_line_via_column(order_markers, line_y) or \
+                    find_order_for_block_fallback(lines_text, i_start, i_end)
 
-            # --- QTY (Daudz.) ---
+            # --- QTY ---
             qty = 0
             found_qty_tok: Optional[str] = None
 
-            # 1) сначала стартовая строка, окно Daudz.
             for w in words_in_band(lines[i_start], band_map["Daudz."]):
                 if RE_DEC.match(w.text):
                     found_qty_tok = w.text; break
 
-            # 2) если нет — весь блок в окне Daudz.
             if not found_qty_tok:
                 for ii in range(i_start, i_end+1):
                     for w in words_in_band(lines[ii], band_map["Daudz."]):
                         if RE_DEC.match(w.text):
                             found_qty_tok = w.text; break
-                    if found_qty_tok:
-                        break
+                    if found_qty_tok: break
 
-            # 3) если всё ещё нет — ищем «GAB ... 7,00»
             if not found_qty_tok:
-                # сначала стартовая линия
                 toks = lines_text[i_start].split()
                 for p, t in enumerate(toks):
                     if "GAB" in t.upper():
@@ -246,7 +267,6 @@ def parse_pdf_to_df(pdf_bytes: bytes) -> pd.DataFrame:
                             if RE_DEC.match(t2):
                                 found_qty_tok = t2; break
                         if found_qty_tok: break
-                # затем во всём блоке
                 if not found_qty_tok:
                     for ii in range(i_start, i_end+1):
                         toks = lines_text[ii].split()
@@ -263,7 +283,6 @@ def parse_pdf_to_df(pdf_bytes: bytes) -> pd.DataFrame:
                 except Exception: qty = 0
 
             # --- TOTAL (Summa) ---
-            # ищем самый правый денежный токен в окне Summa в рамках блока
             money: List[Tuple[float, str]] = []
             for ii in range(i_start, i_end+1):
                 for w in words_in_band(lines[ii], band_map["Summa"]):
@@ -274,7 +293,6 @@ def parse_pdf_to_df(pdf_bytes: bytes) -> pd.DataFrame:
                 money.sort(key=lambda t: t[0])
                 total_tok = money[-1][1]
             else:
-                # fallback: крайний правый денежный во всём блоке
                 money2 = []
                 for ii in range(i_start, i_end+1):
                     for w in lines[ii]:
@@ -284,16 +302,14 @@ def parse_pdf_to_df(pdf_bytes: bytes) -> pd.DataFrame:
                     money2.sort(key=lambda t: t[0])
                     total_tok = money2[-1][1]
 
-            total_str = fmt_money(total_tok) if total_tok else "0,00"
+            total_str = fmt_money(total_tok)
 
-            # защита: если total == qty (например 400,00) — возьмём следующий справа кандидат
+            # защита от совпадения total == qty (например 400,00)
             try:
-                if total_tok and abs(to_int(total_tok) - qty) == 0:
-                    # попробуем взять предпредпоследнюю сумму из окна Summa
-                    if money and len(money) >= 2:
-                        alt = money[-2][1]
-                        if abs(to_int(alt) - qty) != 0:
-                            total_str = fmt_money(alt)
+                if total_tok and abs(to_int(total_tok) - qty) == 0 and len(money) >= 2:
+                    alt = money[-2][1]
+                    if abs(to_int(alt) - qty) != 0:
+                        total_str = fmt_money(alt)
             except Exception:
                 pass
 
@@ -309,16 +325,8 @@ def parse_pdf_to_df(pdf_bytes: bytes) -> pd.DataFrame:
         return pd.DataFrame(columns=["MPN","Replacem","Quantity","Totalsprice","Order reference"])
 
     df = pd.DataFrame(out_rows)
-
-    # удаляем только полностью идентичные строки (чтобы не потерять позиции)
     df = df.drop_duplicates(keep="last")
-
-    # финальный порядок и сортировка
-    cols = ["MPN","Replacem","Quantity","Totalsprice","Order reference"]
-    for c in cols:
-        if c not in df.columns:
-            df[c] = ""
-    df = df[cols]
+    df = df[["MPN","Replacem","Quantity","Totalsprice","Order reference"]]
     df = df.sort_values(["Order reference","MPN"]).reset_index(drop=True)
     return df
 
@@ -350,7 +358,7 @@ if pdf_file:
         )
 else:
     st.info(
-        "Парсим по координатам и по блокам: каждая позиция = блок от MPN до следующего MPN. "
-        "Order — последнее упоминание (#1xxxxx, Order_1xxxxx, одиночное 1xxxxx). "
-        "Qty — в Daudz., Total — самый правый в Summa. Если шапки нет — автоматический fallback по ширине."
+        "Order № теперь ловится по «вертикальной колонке» на странице (по X‑координате) "
+        "и привязывается к ближайшей ниже позиции. Если колонки нет — fallback-поиск вверх/внутри/вниз. "
+        "Qty — колонка Daudz., Total — крайняя справа сумма в Summa."
     )
