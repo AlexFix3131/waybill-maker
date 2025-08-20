@@ -1,7 +1,7 @@
 # app.py
 import io, re, statistics
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import fitz  # PyMuPDF
 import pandas as pd
@@ -11,15 +11,16 @@ from openpyxl import Workbook, load_workbook
 st.set_page_config(page_title="Waybill Maker", page_icon="📦", layout="wide")
 st.title("📦 Waybill Maker")
 
-# ---------- Regex ----------
-# NEW: любые 11 цифр (с опц. ведущей C, которую удаляем)
-RE_MPN   = re.compile(r"\b(?:C)?(\d{11})\b")
-RE_MONEY = re.compile(r"\d{1,3}(?:[ \u00A0]?\d{3})*[.,]\d{2}")
-RE_DEC   = re.compile(r"^\d{1,6}[.,]\d{2}$")
+# ───────────────── Regex ─────────────────
+# MPN: 11 цифр, допускаем ведущую C (удаляем её), но потом кандидата валидируем по наличию qty+sum.
+RE_MPN      = re.compile(r"\b(?:C)?(\d{11})\b")
+RE_INT      = re.compile(r"^\d{1,4}$")
+RE_DEC      = re.compile(r"^\d{1,6}[.,]\d{2}$")
+RE_MONEY    = re.compile(r"\d{1,3}(?:[ \u00A0]?\d{3})*[.,]\d{2}")
 
-RE_HDR_ART = re.compile(r"(?i)artik|artikul")
-RE_HDR_QTY = re.compile(r"(?i)daudz")
-RE_HDR_SUM = re.compile(r"(?i)summa|summ")
+RE_HDR_ART  = re.compile(r"(?i)artik|artikul")
+RE_HDR_QTY  = re.compile(r"(?i)daudz")
+RE_HDR_SUM  = re.compile(r"(?i)summa|summ")
 
 RE_ORDER = [
     re.compile(r"(?:^|\s)#\s*(1\d{5})(?:\s|$)"),
@@ -32,14 +33,10 @@ def to_float(s: str) -> float:
 def to_int(s: str) -> int:
     return int(round(to_float(s)))
 
-# NEW: теперь всегда отдаем строку с ТОЧКОЙ
+# В Excel просил точку — делаем точку.
 def fmt_money_dot(s: Optional[str]) -> str:
     if not s: return "0.00"
-    try:
-        return f"{to_float(s):.2f}"
-    except Exception:
-        # если вдруг не разобралась — последний шанс
-        return s.replace(",", ".")
+    return f"{to_float(s):.2f}"
 
 @dataclass
 class Word:
@@ -54,7 +51,7 @@ class Band:
 class OrderMark:
     x: float; y: float; value: str
 
-# ---------- PDF helpers ----------
+# ───────────────── helpers ─────────────────
 def load_words_per_page(pdf: bytes) -> List[List[Word]]:
     doc = fitz.open(stream=pdf, filetype="pdf")
     out=[]
@@ -70,13 +67,12 @@ def group_lines(words: List[Word]) -> List[Line]:
     h = statistics.median(heights) if heights else 8.0
     ytol=max(1.2, h*0.65)
 
-    cur=[]; last=None; res=[]
+    res=[]; cur=[]; last=None
     for w in words:
         if last is None or abs(w.y0-last)<=ytol:
             cur.append(w); last = w.y0 if last is None else (last+w.y0)/2
         else:
-            cur.sort(key=lambda t:t.x0)
-            res.append(cur); cur=[w]; last=w.y0
+            cur.sort(key=lambda t:t.x0); res.append(cur); cur=[w]; last=w.y0
     if cur: cur.sort(key=lambda t:t.x0); res.append(cur)
 
     out=[]
@@ -105,7 +101,7 @@ def detect_bands(lines: List[Line], words: List[Word]) -> List[Band]:
                 for b,nm in zip(sorted(bands,key=lambda b:b.x_left),["Artikuls","Daudz.","Summa"]):
                     b.name=nm
                 return bands
-    # грубо по ширине
+    # запасной вариант по ширине
     x_min=min(w.x0 for w in words); x_max=max(w.x1 for w in words); W=x_max-x_min
     return [
         Band("Artikuls", x_min-10, x_min+0.47*W),
@@ -117,7 +113,7 @@ def in_band(w: Word, b: Band) -> bool:
     cx=(w.x0+w.x1)/2
     return b.x_left<=cx<=b.x_right
 
-# ---------- Order ----------
+# ─────── Order detection ───────
 def order_from_text(txt: str) -> Optional[str]:
     for p in RE_ORDER:
         m=p.search(txt)
@@ -139,14 +135,50 @@ def collect_order_marks(lines: List[Line]) -> List[OrderMark]:
     out.sort(key=lambda m:m.y)
     return out
 
-def order_for_line_y(marks: List[OrderMark], y: float) -> str:
+def nearest_order_above(marks: List[OrderMark], y: float) -> str:
     prev=[m for m in marks if m.y<=y+2]
     if prev: return prev[-1].value
     if not marks: return ""
     best=min(marks, key=lambda m: abs(m.y-y))
     return best.value if abs(best.y-y)<=30 else ""
 
-# ---------- Core ----------
+# ─────── finance tokens join ───────
+def join_money_tokens(tokens: List[Word]) -> Optional[str]:
+    """Собираем справа контактные токены в колонке Summa."""
+    if not tokens: return None
+    tokens.sort(key=lambda w: w.x0)
+    # группируем соседей с маленьким зазором
+    groups=[]; cur=[tokens[0]]
+    for w in tokens[1:]:
+        gap = w.x0 - cur[-1].x1
+        if gap <= 8:  # рядом
+            cur.append(w)
+        else:
+            groups.append(cur); cur=[w]
+    groups.append(cur)
+    # берём группу ПРАВЕЕ всех
+    g = max(groups, key=lambda G: max(w.x1 for w in G))
+    raw = "".join(w.text.replace("\u00A0","").replace(" ","") for w in g)
+    # если нет точки/запятой — ставим перед последними 2 цифрами
+    if not re.search(r"[.,]\d{2}$", raw):
+        raw = re.sub(r"(\d{2})$", r".\1", raw)
+    return raw
+
+def pick_total_for_line(line: Line, sum_band: Band) -> Optional[str]:
+    cands=[w for w in line.words if in_band(w,sum_band) and (RE_MONEY.fullmatch(w.text) or RE_INT.fullmatch(w.text) or RE_DEC.fullmatch(w.text))]
+    if not cands: return None
+    tok = join_money_tokens(cands)
+    if not tok: return None
+    # склейка «левая одиночная цифра» + «0xx,xx»
+    lefts=[w for w in line.words if w.x1<=cands[-1].x0+1 and (cands[-1].x0-w.x1)<=8]
+    if lefts:
+        lefts.sort(key=lambda w:w.x1, reverse=True)
+        Lw=lefts[0]
+        if re.fullmatch(r"[1-9]", Lw.text) and re.fullmatch(r"0\d{2}[.,]\d{2}", tok):
+            tok = Lw.text + tok
+    return tok
+
+# ───────────────── core ─────────────────
 def parse_pdf(pdf: bytes) -> pd.DataFrame:
     pages=load_words_per_page(pdf)
     rows=[]
@@ -154,80 +186,68 @@ def parse_pdf(pdf: bytes) -> pd.DataFrame:
         if not words: continue
         lines=group_lines(words)
         bands=detect_bands(lines, words)
-        b = {b.name:b for b in bands}
+        B = {b.name:b for b in bands}
+        orders=collect_order_marks(lines)
 
-        order_marks=collect_order_marks(lines)
-
-        mpn_idx=[]
+        # кандидаты по MPN
+        cand_idx=[]
         for i,L in enumerate(lines):
             if RE_MPN.search(L.text):
-                mpn_idx.append(i)
+                cand_idx.append(i)
 
-        for i in mpn_idx:
+        for i in cand_idx:
             L=lines[i]
             m=RE_MPN.search(L.text)
             if not m: continue
-            mpn=m.group(1)  # уже без 'C'
+            mpn=m.group(1)
 
-            order = order_for_line_y(order_marks, L.y)
-
-            # qty (Daudz.) — ближайший по Y (смотрим до ±2 строк)
+            # qty из Daudz. — целое число, сначала в своей строке, потом ±1
             qty_tok=None; best=(1e9,None)
-            for d in [0,1,2]:
+            for d in [0,1]:
                 for sgn in (0,-1,1):
                     j=i+sgn*d
                     if j<0 or j>=len(lines): continue
                     for w in lines[j].words:
-                        if in_band(w, b["Daudz."]) and RE_DEC.match(w.text):
+                        if in_band(w, B["Daudz."]) and (RE_INT.fullmatch(w.text) or RE_DEC.fullmatch(w.text)):
                             dy=abs(lines[j].y - L.y)
                             if dy<best[0]:
                                 best=(dy,w.text)
                 if best[1]: break
-            qty = to_int(best[1]) if best[1] else 0
+            qty = to_int(best[1]) if best[1] else None
 
-            # total (Summa) — правая сумма + склейка "левое число" + "0xx,xx"
-            def pick_total(line: Line) -> Optional[str]:
-                c=[w for w in line.words if in_band(w,b["Summa"]) and RE_MONEY.fullmatch(w.text)]
-                if not c: return None
-                c.sort(key=lambda w:max(w.x0,w.x1))
-                t=c[-1]
-                tok=t.text
-                # склейка с цифрой слева
-                lefts=[w for w in line.words if w.x1<=t.x0+1 and (t.x0-w.x1)<=8]
-                if lefts:
-                    lefts.sort(key=lambda w:w.x1, reverse=True)
-                    lw=lefts[0]
-                    if re.fullmatch(r"[1-9]", lw.text) and re.fullmatch(r"0\d{2}[.,]\d{2}", tok):
-                        tok = lw.text + tok
-                return tok
-
+            # total из Summa (склейка токенов)
             total_tok=None; bestT=(1e9,None)
-            for d in [0,1,2]:
+            for d in [0,1]:
                 for sgn in (0,-1,1):
                     j=i+sgn*d
                     if j<0 or j>=len(lines): continue
-                    tok=pick_total(lines[j])
+                    tok=pick_total_for_line(lines[j], B["Summa"])
                     if tok:
                         dy=abs(lines[j].y - L.y)
                         if dy<bestT[0]:
                             bestT=(dy,tok)
                 if bestT[1]: break
-            total = fmt_money_dot(bestT[1])
+            total = fmt_money_dot(bestT[1]) if bestT[1] else None
 
-            # если total == qty (по значению) и есть ещё суммы — возьми самую правую из строки
+            # ВАЛИДАЦИЯ СТРОКИ: без пары qty+total — выбрасываем (это и отсекает номера из шапки).
+            if qty is None or total is None:
+                continue
+
+            order = nearest_order_above(orders, L.y)
+
+            # если total == qty (по числу), но в строке есть ещё одна сумма — возьмём правую
             try:
-                if bestT[1] and abs(to_int(bestT[1]) - qty) == 0:
-                    c=[w for w in L.words if in_band(w,b["Summa"]) and RE_MONEY.fullmatch(w.text)]
-                    c.sort(key=lambda w:max(w.x0,w.x1))
+                if abs(to_int(bestT[1]) - qty) == 0:
+                    c=[w for w in L.words if in_band(w,B["Summa"]) and (RE_MONEY.fullmatch(w.text) or RE_INT.fullmatch(w.text) or RE_DEC.fullmatch(w.text))]
                     if len(c)>=2:
-                        total = fmt_money_dot(c[-1].text)
+                        total = fmt_money_dot(join_money_tokens(c))
             except: pass
 
             rows.append({
                 "MPN": mpn,
                 "Replacem": "",
                 "Quantity": qty,
-                "Totalsprice": total,         # уже с точкой
+                "Totalsprice": total,          # с точкой
                 "Order reference": order
             })
 
@@ -238,7 +258,7 @@ def parse_pdf(pdf: bytes) -> pd.DataFrame:
     df.reset_index(drop=True, inplace=True)
     return df
 
-# ---------- UI ----------
+# ───────────────── UI ─────────────────
 pdf_file = st.file_uploader("Загрузить PDF-счёт", type=["pdf"])
 tpl_file = st.file_uploader("Шаблон Excel (необязательно)", type=["xlsx"])
 
@@ -261,4 +281,4 @@ if pdf_file:
                            file_name="waybill.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 else:
-    st.info("Парсер: MPN = любые 11 цифр (без ведущей C); Qty — колонка Daudz.; Total — правая сумма из Summa со склейкой; Order — ближайший сверху.")
+    st.info("Фильтрация лишних MPN: оставляем только те строки, у которых рядом нашлись и Daudz., и Summa; qty — целое, total — склейка токенов справа; order — ближайший сверху.")
