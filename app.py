@@ -1,9 +1,4 @@
-# app.py — Waybill Maker (quiet UI; Japafrica text-only + ZF Scandi + Fallback)
-# Правки:
-#  • Japafrica принудительно в TEXT-режиме (qty = 'xx.xx', total = последняя денежная справа)
-#  • RE_MONEY поддерживает пробел/nbsp/ТОЧКУ как разделитель тысяч
-#  • «Последний Order nr» тянется на строки без номера
-#  • Только Excel (CSV убран)
+# app.py — Waybill Maker (Japafrica text-only; нормальная нормализация чисел; carry-over Order#; без CSV)
 
 import io, re, statistics
 from dataclasses import dataclass
@@ -25,7 +20,8 @@ RE_MPN_ZF         = re.compile(r"\b\d{3,4}\.\d{3}\.\d{3}\b")
 
 RE_INT   = re.compile(r"^\d{1,4}$")
 RE_DEC   = re.compile(r"^\d{1,6}[.,]\d{2}$")
-RE_MONEY = re.compile(r"\d{1,3}(?:[ .\u00A0]?\d{3})*[.,]\d{2}")  # '3.980,89' / '6 349,20' / '6349,20'
+# поддержка: 3.980,89 / 6 349,20 / 6349,20 / 6349.20
+RE_MONEY = re.compile(r"\d{1,3}(?:[ .\u00A0]?\d{3})*[.,]\d{2}")
 
 RE_HDR_ART_LV = re.compile(r"(?i)artik|artikul")
 RE_HDR_QTY_LV = re.compile(r"(?i)daudz")
@@ -40,25 +36,50 @@ RE_ORDER = [
     re.compile(r"(?<![\d.,])(1\d{5})(?![\d.,])"),
 ]
 
+# ───────────────── Normalization ─────────────────
+def normalize_number(s: str) -> str:
+    s = s.replace("\u00A0", " ").strip()
+    # remove spaces (thousands)
+    s = s.replace(" ", "")
+    has_dot = "." in s
+    has_com = "," in s
+    if has_dot and has_com:
+        # EU style: 1.234,56 or 1,234.56 (берём последний разделитель как десятичный)
+        # чаще: . — thousands, , — decimal
+        s = s.replace(".", "")
+        s = s.replace(",", ".")
+    elif has_com and not has_dot:
+        s = s.replace(",", ".")
+    else:
+        # только точка или ни одного: оставляем как есть
+        pass
+    return s
+
 def to_float(s: str) -> float:
-    return float(s.replace("\u00A0"," ").replace(" ","").replace(".","").replace(",","."))
+    return float(normalize_number(s))
 
 def to_int(s: str) -> int:
     return int(round(to_float(s)))
 
 def fmt_money_dot(s: Optional[str]) -> str:
-    if not s: return "0.00"
+    if not s:
+        return "0.00"
     return f"{to_float(s):.2f}"
 
 @dataclass
-class Word:  x0: float; y0: float; x1: float; y1: float; text: str
+class Word:
+    x0: float; y0: float; x1: float; y1: float; text: str
 @dataclass
-class Line:  y: float; words: List[Word]; text: str
+class Line:
+    y: float; words: List[Word]; text: str
 @dataclass
-class Band:  name: str; x_left: float; x_right: float
+class Band:
+    name: str; x_left: float; x_right: float
 @dataclass
-class OrderMark: x: float; y: float; value: str
+class OrderMark:
+    x: float; y: float; value: str
 
+# ───────────────── low-level text ─────────────────
 def load_words_per_page(pdf_bytes: bytes) -> List[List[Word]]:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     out=[]
@@ -73,6 +94,7 @@ def group_lines(words: List[Word]) -> List[Line]:
     heights=[w.y1-w.y0 for w in words if (w.y1-w.y0)>0.2]
     h = statistics.median(heights) if heights else 8.0
     ytol=max(1.2, h*0.65)
+
     res=[]; cur=[]; last=None
     for w in words:
         if last is None or abs(w.y0-last)<=ytol:
@@ -80,6 +102,7 @@ def group_lines(words: List[Word]) -> List[Line]:
         else:
             cur.sort(key=lambda t:t.x0); res.append(cur); cur=[w]; last=w.y0
     if cur: cur.sort(key=lambda t:t.x0); res.append(cur)
+
     out=[]
     for ln in res:
         y=statistics.fmean([w.y0 for w in ln])
@@ -96,14 +119,18 @@ def join_money_tokens(tokens: List[Word], gap_limit: int = 8) -> Optional[str]:
     tokens.sort(key=lambda w: w.x0)
     groups=[]; cur=[tokens[0]]
     for w in tokens[1:]:
-        if (w.x0 - cur[-1].x1) <= gap_limit: cur.append(w)
-        else: groups.append(cur); cur=[w]
+        if (w.x0 - cur[-1].x1) <= gap_limit:
+            cur.append(w)
+        else:
+            groups.append(cur); cur=[w]
     groups.append(cur)
     g = max(groups, key=lambda G: max(w.x1 for w in G))
     raw = "".join(w.text.replace("\u00A0","").replace(" ","") for w in g)
     if not re.search(r"[.,]\d{2}$", raw):
-        if re.fullmatch(r"\d{1,9}", raw): raw = raw + ".00"
-        else: raw = re.sub(r"(\d{2})$", r".\1", raw)
+        if re.fullmatch(r"\d{1,9}", raw):
+            raw = raw + ".00"
+        else:
+            raw = re.sub(r"(\d{2})$", r".\1", raw)
     return raw
 
 def pick_total_for_line(line: Line, sum_band: Band) -> Optional[str]:
@@ -252,8 +279,8 @@ class JapafricaParser(BaseParser):
         return has_fact and has_qty and has_eur
 
     def parse_page(self, lines: List[Line], words: List[Word]) -> List[dict]:
-        # TEXT-режим: Total = последняя денежная справа; Qty = xx,xx/xx.xx по метке или ближайшее к total
         rows=[]
+        # ищем блок таблицы начиная после шапки POS/REF/QTY/EUR (если есть)
         header_idx=None
         pat_header=re.compile(r"(?i)\bpos\b.*\b(qty|quant|unid)\b.*\b(eur|€)\b")
         for i,L in enumerate(lines):
@@ -262,36 +289,47 @@ class JapafricaParser(BaseParser):
         start = header_idx+1 if header_idx is not None else 0
 
         money_rx = RE_MONEY
-        qty_mark = re.compile(r"(?i)\b(qty|quant|unid)\D{0,12}(\d{1,3}[.,]\d{2})")
+        qty_mark = re.compile(r"(?i)\b(qty|quant|unid)\D{0,20}(\d{1,3}[.,]\d{2})")
 
-        for L in lines[start:]:
+        for i in range(start, len(lines)):
+            L = lines[i]
             txt=L.text
             m = RE_MPN_DOT_OPT_C.search(txt) or RE_MPN_11D.search(txt) or RE_MPN_ZF.search(txt)
             if not m: 
                 continue
             mpn = m.group(1) if m.lastindex else m.group(0)
 
-            rest = txt[m.end():]
-            moneys = list(money_rx.finditer(rest))
-            if not moneys: 
+            # TOTAL = последняя денежная справа В ЭТОЙ ЖЕ СТРОКЕ
+            moneys = list(money_rx.finditer(txt[m.end():]))
+            if not moneys:
+                # попробуем взять из следующей строки (иногда Total разбит переносом)
+                if i+1 < len(lines):
+                    moneys = list(money_rx.finditer(lines[i+1].text))
+            if not moneys:
                 continue
             total_raw = moneys[-1].group(0)
             total_out = fmt_money_dot(total_raw)
 
-            pre = rest[:moneys[-1].start()]
-            mq = qty_mark.search(pre)
-            if mq:
-                qty_raw = mq.group(2)
-            else:
-                cands = list(re.finditer(r"\b(\d{1,3}[.,]\d{2})\b", pre))
-                qty_raw = cands[-1].group(1) if cands else None
+            # QTY — ищем по метке в этой строке, если нет — в соседних (±1)
+            qty_raw = None
+            for j in (i, i-1, i+1):
+                if 0 <= j < len(lines):
+                    t = lines[j].text
+                    mq = qty_mark.search(t)
+                    if mq:
+                        qty_raw = mq.group(2)
+                        break
+            if not qty_raw:
+                # иначе ближайшее к total число вида \d{1,3}[.,]\d{2} в этой строке
+                candidates = list(re.finditer(r"\b(\d{1,3}[.,]\d{2})\b", txt))
+                qty_raw = candidates[-1].group(1) if candidates else None
             if not qty_raw:
                 continue
 
             rows.append({
                 "MPN": mpn[1:] if mpn.startswith("C") else mpn,
                 "Replacem": "",
-                "Quantity": qty_raw.replace(",", "."),  # '26.00'
+                "Quantity": normalize_number(qty_raw),  # строка '26.00'
                 "Totalsprice": total_out,
                 "Order reference": ""
             })
@@ -351,7 +389,7 @@ class FallbackParser(BaseParser):
 # Реестр парсеров
 PARSERS: List[Type[BaseParser]] = [JapafricaParser, ZFScandiParser, FallbackParser]
 
-# ───────────────── Router с «тащим Order nr» ─────────────────
+# ───────────────── Router с переносом Order# ─────────────────
 def parse_pdf_with_registry(pdf_bytes: bytes) -> pd.DataFrame:
     pages=load_words_per_page(pdf_bytes)
     all_rows=[]; last_seen_order=""
@@ -369,8 +407,7 @@ def parse_pdf_with_registry(pdf_bytes: bytes) -> pd.DataFrame:
                 inst=cls()
                 if inst.matches(lines, words):
                     parser=inst; break
-            except:
-                continue
+            except: continue
         if parser is None: parser=FallbackParser()
 
         try:
