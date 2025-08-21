@@ -1,4 +1,10 @@
-# app.py — Waybill Maker (quiet UI; Japafrica + ZF Scandi + Fallback; CSV убран)
+# app.py — Waybill Maker (quiet UI; Japafrica + ZF Scandi + Fallback)
+# Правки:
+#  • RE_MONEY принимает пробел/nbsp/ТОЧКУ как разделитель тысяч (ловим 3.980,89)
+#  • Japafrica: текстовый режим — Qty = '26.00', Total = '6349.20' (не слепляем)
+#  • "Последний Order nr" тянется на строки без номера (продолжение счета/страницы)
+#  • Убрана кнопка CSV — только Excel/шаблон
+
 import io, re, statistics
 from dataclasses import dataclass
 from typing import List, Optional, Type
@@ -19,13 +25,14 @@ RE_MPN_ZF         = re.compile(r"\b\d{3,4}\.\d{3}\.\d{3}\b")           # 0750.11
 
 RE_INT   = re.compile(r"^\d{1,4}$")
 RE_DEC   = re.compile(r"^\d{1,6}[.,]\d{2}$")
-RE_MONEY = re.compile(r"\d{1,3}(?:[ \u00A0]?\d{3})*[.,]\d{2}")
+# ВАЖНО: разрешаем пробел/nbsp/ТОЧКУ как разделитель тысяч.
+RE_MONEY = re.compile(r"\d{1,3}(?:[ .\u00A0]?\d{3})*[.,]\d{2}")
 
 # LV/EN headers (для Fallback)
 RE_HDR_ART_LV = re.compile(r"(?i)artik|artikul")
 RE_HDR_QTY_LV = re.compile(r"(?i)daudz")
 RE_HDR_SUM_LV = re.compile(r"(?i)summa|summ")
-RE_HDR_PART_EN= re.compile(r"(?i)\bpart\b|ref|pe[cç]a")  # ← токены по одному
+RE_HDR_PART_EN= re.compile(r"(?i)\bpart\b|ref|pe[cç]a")
 RE_HDR_QTY_EN = re.compile(r"(?i)\bqty\b|quant\.?|quantidade")
 RE_HDR_SUM_EN = re.compile(r"(?i)\beur\b|€|\bamount\b|\btotal\b|\bsum\b")
 
@@ -258,11 +265,10 @@ class JapafricaParser(BaseParser):
 
     # токены заголовков — по одному слову
     RE_PART_HDR = re.compile(r"(?i)\b(part|ref|pe[cç]a)\b")
-    RE_QTY_HDR  = re.compile(r"(?i)\bqty\b|quant\.?")
-    RE_EUR_HDR  = re.compile(r"(?i)\beur\b|€|\bamount\b|\btotal\b")
+    RE_QTY_HDR  = re.compile(r"(?i)\b(qty|quant|unid)\b")
+    RE_EUR_HDR  = re.compile(r"(?i)\b(eur)\b|€|\bamount\b|\btotal\b")
 
     def matches(self, lines: List[Line], words: List[Word]) -> bool:
-        # не требуем «JAPAFRICA» — достаточно FACTURA/INVOICE и наличия шапки POS/REF/QTY/EUR
         head="\n".join(L.text for L in lines[:180])
         has_fact = ("FACTURA" in head) or ("INVOICE" in head)
         has_qty  = self.RE_QTY_HDR.search(head) is not None
@@ -295,11 +301,11 @@ class JapafricaParser(BaseParser):
     def _parse_text_mode(self, lines: List[Line]) -> List[dict]:
         """Без координат: последняя денежная в строке — Total; qty — ближайшее ненулевое число перед ней."""
         rows=[]
-        # найти заголовок POS/REF.../QTY/ EUR
+        # заголовок POS / (REF|PART|PEÇA) / (QTY|QUANT|UNID) / (EUR|€)
         header_idx=None
-        pat_header=re.compile(r"(?i)\bpos\b.*\b(ref|part)\b.*\b(qty|quant)\b.*\b(eur|€)\b")
+        pat_header=re.compile(r"(?i)\bpos\b.*\b(ref|part|pe[cç]a)\b.*\b(qty|quant|unid)\b.*\b(eur|€)\b")
         for i,L in enumerate(lines):
-            norm=L.text.replace("  "," ").replace(" .",".")
+            norm=L.text.replace("  "," ")
             if pat_header.search(norm):
                 header_idx=i; break
         start = header_idx+1 if header_idx is not None else 0
@@ -307,31 +313,37 @@ class JapafricaParser(BaseParser):
         for L in lines[start:]:
             txt=L.text
             m = RE_MPN_DOT_OPT_C.search(txt) or RE_MPN_11D.search(txt) or RE_MPN_ZF.search(txt)
-            if not m: 
+            if not m:
                 continue
             mpn = m.group(1) if m.lastindex else m.group(0)
 
             rest = txt[m.end():]
-            moneys = list(re.finditer(r"(\d{1,3}(?:[ \u00A0]?\d{3})*[.,]\d{2})", rest))
+            moneys = list(re.finditer(r"\d{1,3}(?:[ .\u00A0]?\d{3})*[.,]\d{2}", rest))
             if not moneys:
                 continue
-            total = moneys[-1].group(1)
+            total = moneys[-1].group(0)  # последняя денежная справа
 
             pre = rest[:moneys[-1].start()]
-            tokens = re.findall(r"\b(\d{1,3}(?:[.,]\d{2})?)\b", pre)
-            qty = None
-            for tok in reversed(tokens):
-                if re.fullmatch(r"0+[.,]00", tok):  # пропускаем скидку 0.00
-                    continue
-                qty = to_int(tok)
-                break
-            if qty is None:
+            qty_tok = None
+            # сначала пытаемся по меткам
+            q = re.search(r"(?i)\b(qty|quant|unid)\D{0,12}(\d{1,3}(?:[.,]\d{2})?)", pre)
+            if q:
+                qty_tok = q.group(2)
+            else:
+                # иначе просто ближайшее число перед total (не '0.00')
+                tokens = re.findall(r"\b(\d{1,3}(?:[.,]\d{2})?)\b", pre)
+                for tok in reversed(tokens):
+                    if re.fullmatch(r"0+[.,]00", tok):
+                        continue
+                    qty_tok = tok
+                    break
+            if not qty_tok:
                 continue
 
             rows.append({
                 "MPN": mpn[1:] if mpn.startswith("C") else mpn,
                 "Replacem": "",
-                "Quantity": qty,
+                "Quantity": qty_tok.replace(",", "."),            # ← отдаем '26.00'
                 "Totalsprice": fmt_money_dot(total),
                 "Order reference": ""
             })
@@ -403,12 +415,19 @@ class FallbackParser(BaseParser):
 # Реестр (узкие сверху, общий — в конце)
 PARSERS: List[Type[BaseParser]] = [JapafricaParser, ZFScandiParser, FallbackParser]
 
+# ───────────────── Router с «тащим Order nr» ─────────────────
 def parse_pdf_with_registry(pdf_bytes: bytes) -> pd.DataFrame:
     pages=load_words_per_page(pdf_bytes)
-    all_rows=[]
+    all_rows=[]; last_seen_order=""
+
     for words in pages:
         if not words: continue
         lines=group_lines(words)
+
+        # вытащим order с этой страницы (если есть), иначе используем последний известный
+        page_marks = collect_order_marks(lines)
+        page_order = page_marks[-1].value if page_marks else last_seen_order
+
         # выбор парсера
         parser=None
         for cls in PARSERS:
@@ -416,13 +435,23 @@ def parse_pdf_with_registry(pdf_bytes: bytes) -> pd.DataFrame:
                 inst=cls()
                 if inst.matches(lines, words):
                     parser=inst; break
-            except: continue
+            except:
+                continue
         if parser is None: parser=FallbackParser()
-        # парсим страницу защищённо
+
+        # парсим страницу (и подставляем page_order где пусто)
         try:
-            all_rows.extend(parser.parse_page(lines, words))
+            rows=parser.parse_page(lines, words)
+            if page_order:
+                for r in rows:
+                    if not r.get("Order reference"):
+                        r["Order reference"] = page_order
+            all_rows.extend(rows)
+            if page_order:
+                last_seen_order = page_order
         except:
             continue
+
     df=pd.DataFrame(all_rows).drop_duplicates(keep="last")
     if df.empty:
         return pd.DataFrame(columns=["MPN","Replacem","Quantity","Totalsprice","Order reference"])
@@ -443,7 +472,7 @@ if pdf_file:
     st.subheader("Предпросмотр")
     st.dataframe(df, use_container_width=True)
 
-    # Только Excel
+    # Только Excel (CSV отключён)
     if st.button("⬇️ Скачать Excel"):
         if tpl_file:
             wb=load_workbook(tpl_file); ws=wb.active
