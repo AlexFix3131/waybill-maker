@@ -1,9 +1,9 @@
 # app.py — Waybill Maker (quiet UI; Japafrica + ZF Scandi + Fallback)
 # Правки:
-#  • RE_MONEY принимает пробел/nbsp/ТОЧКУ как разделитель тысяч (ловим 3.980,89)
-#  • Japafrica: текстовый режим — Qty = '26.00', Total = '6349.20' (не слепляем)
-#  • "Последний Order nr" тянется на строки без номера (продолжение счета/страницы)
-#  • Убрана кнопка CSV — только Excel/шаблон
+#  • RE_MONEY принимает пробел/nbsp/ТОЧКУ как разделитель тысяч (ловим 3.980,89 / 6 349,20)
+#  • Japafrica: qty берём по метке QTY/QUANT/UNID как xx,xx/xx.xx (строка '26.00'); total — последняя денежная справа (6349.20)
+#  • «Последний Order nr» тянется на строки без номера (продолжение счета/страницы)
+#  • Только Excel (CSV убран)
 
 import io, re, statistics
 from dataclasses import dataclass
@@ -263,7 +263,6 @@ class ZFScandiParser(BaseParser):
 class JapafricaParser(BaseParser):
     NAME="Japafrica"
 
-    # токены заголовков — по одному слову
     RE_PART_HDR = re.compile(r"(?i)\b(part|ref|pe[cç]a)\b")
     RE_QTY_HDR  = re.compile(r"(?i)\b(qty|quant|unid)\b")
     RE_EUR_HDR  = re.compile(r"(?i)\b(eur)\b|€|\bamount\b|\btotal\b")
@@ -290,7 +289,6 @@ class JapafricaParser(BaseParser):
                     left=(vals[i-1][1]+cx)/2 if i>0 else cx-100
                     right=(cx+vals[i+1][1])/2 if i<len(vals)-1 else cx+200
                     bands.append(Band(n,left,right))
-                # map в нашу схему
                 mapped=[]
                 for b in sorted(bands, key=lambda b:b.x_left):
                     nm = "Artikuls" if b.name=="Part" else ("Daudz." if b.name=="Qty" else "Summa")
@@ -299,16 +297,21 @@ class JapafricaParser(BaseParser):
         return None
 
     def _parse_text_mode(self, lines: List[Line]) -> List[dict]:
-        """Без координат: последняя денежная в строке — Total; qty — ближайшее ненулевое число перед ней."""
+        """
+        Без координат: Total = последняя денежная справа;
+        Qty = число с ДВУМЯ знаками (xx,xx/xx.xx) рядом с меткой QTY|QUANT|UNID,
+        иначе ближайшее к Total число формата \d{1,3}[.,]\d{2}.
+        """
         rows=[]
-        # заголовок POS / (REF|PART|PEÇA) / (QTY|QUANT|UNID) / (EUR|€)
         header_idx=None
         pat_header=re.compile(r"(?i)\bpos\b.*\b(ref|part|pe[cç]a)\b.*\b(qty|quant|unid)\b.*\b(eur|€)\b")
         for i,L in enumerate(lines):
-            norm=L.text.replace("  "," ")
-            if pat_header.search(norm):
+            if pat_header.search(L.text.replace("  "," ")):
                 header_idx=i; break
         start = header_idx+1 if header_idx is not None else 0
+
+        money_rx = re.compile(r"\d{1,3}(?:[ .\u00A0]?\d{3})*[.,]\d{2}")  # 6 349,20 / 6.349,20 / 6349,20
+        qty_rx_precise = re.compile(r"(?i)\b(qty|quant|unid)\D{0,12}(\d{1,3}[.,]\d{2})")
 
         for L in lines[start:]:
             txt=L.text
@@ -318,33 +321,29 @@ class JapafricaParser(BaseParser):
             mpn = m.group(1) if m.lastindex else m.group(0)
 
             rest = txt[m.end():]
-            moneys = list(re.finditer(r"\d{1,3}(?:[ .\u00A0]?\d{3})*[.,]\d{2}", rest))
+            moneys = list(money_rx.finditer(rest))
             if not moneys:
                 continue
-            total = moneys[-1].group(0)  # последняя денежная справа
+            total_raw = moneys[-1].group(0)  # последняя денежная справа
+            total_out = fmt_money_dot(total_raw)
 
             pre = rest[:moneys[-1].start()]
-            qty_tok = None
-            # сначала пытаемся по меткам
-            q = re.search(r"(?i)\b(qty|quant|unid)\D{0,12}(\d{1,3}(?:[.,]\d{2})?)", pre)
-            if q:
-                qty_tok = q.group(2)
+            mqty = qty_rx_precise.search(pre)
+            if mqty:
+                qty_raw = mqty.group(2)
             else:
-                # иначе просто ближайшее число перед total (не '0.00')
-                tokens = re.findall(r"\b(\d{1,3}(?:[.,]\d{2})?)\b", pre)
-                for tok in reversed(tokens):
-                    if re.fullmatch(r"0+[.,]00", tok):
-                        continue
-                    qty_tok = tok
-                    break
-            if not qty_tok:
+                candidates = list(re.finditer(r"\b(\d{1,3}[.,]\d{2})\b", pre))
+                qty_raw = candidates[-1].group(1) if candidates else None
+            if not qty_raw:
                 continue
+
+            qty_out = qty_raw.replace(",", ".")  # строка '26.00'
 
             rows.append({
                 "MPN": mpn[1:] if mpn.startswith("C") else mpn,
                 "Replacem": "",
-                "Quantity": qty_tok.replace(",", "."),            # ← отдаем '26.00'
-                "Totalsprice": fmt_money_dot(total),
+                "Quantity": qty_out,
+                "Totalsprice": total_out,
                 "Order reference": ""
             })
         return rows
@@ -353,7 +352,6 @@ class JapafricaParser(BaseParser):
         bands=self._detect_bands(lines, words)
         if bands:
             rows=self._extract_rows_by_bands(lines, bands)
-            # постобработка: C81…. → 81….
             for r in rows:
                 if isinstance(r["MPN"], str) and r["MPN"].startswith("C") and re.fullmatch(r"C\d{2}\.\d{5}-\d{3,4}", r["MPN"]):
                     r["MPN"]=r["MPN"][1:]
