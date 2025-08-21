@@ -1,5 +1,5 @@
-# app.py — Waybill Maker (multi-parser: Japafrica + ZF Scandi)
-import io, re, statistics
+# app.py — Waybill Maker (robust router + Japafrica + ZF Scandi)
+import io, re, statistics, traceback
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Type
 
@@ -14,17 +14,13 @@ st.title("📦 Waybill Maker")
 
 with st.sidebar:
     st.header("Парсеры")
-    st.caption("Выходные колонки: MPN | Replacem | Quantity | Totalsprice | Order reference")
+    st.caption("Выходные колонки фиксированы: MPN | Replacem | Quantity | Totalsprice | Order reference")
+    debug = st.toggle("Показывать диагностику", value=False)
 
 # ───────────────── Regex (общие) ─────────────────
-# 11 цифр (допускаем ведущую C → берём только цифры)
-RE_MPN_11D = re.compile(r"\bC?(\d{11})\b")
-
-# 81.36304-0019 и т.п. (допускаем ведущую C → берём без неё)
-RE_MPN_DOT_OPT_C = re.compile(r"\bC?(\d{2}\.\d{5}-\d{3,4})\b")
-
-# ZF формат: 0750.117.859 / 4475.305.212
-RE_MPN_ZF = re.compile(r"\b\d{3,4}\.\d{3}\.\d{3}\b")
+RE_MPN_11D = re.compile(r"\bC?(\d{11})\b")  # 11 цифр; 'C' отбрасываем
+RE_MPN_DOT_OPT_C = re.compile(r"\bC?(\d{2}\.\d{5}-\d{3,4})\b")  # 81.36304-0019; 'C' отбрасываем
+RE_MPN_ZF = re.compile(r"\b\d{3,4}\.\d{3}\.\d{3}\b")  # 0750.117.859
 
 RE_INT   = re.compile(r"^\d{1,4}$")
 RE_DEC   = re.compile(r"^\d{1,6}[.,]\d{2}$")
@@ -37,9 +33,9 @@ RE_HDR_SUM_LV = re.compile(r"(?i)summa|summ")
 
 RE_HDR_PART_EN = re.compile(r"(?i)\bpart\b|ref\.*\s*ª?\s*pe[cç]a")
 RE_HDR_QTY_EN  = re.compile(r"(?i)\bqty\b|quant")
-RE_HDR_SUM_EN  = re.compile(r"(?i)\beur\b|\bamount\b|\btotal\b|\bsum\b")
+RE_HDR_SUM_EN  = re.compile(r"(?i)\beur\b|€|\bamount\b|\btotal\b|\bsum\b")
 
-# Order reference (например: ORDER 126152 / #126152 / просто 1******)
+# Order reference
 RE_ORDER = [
     re.compile(r"(?:^|\s)#\s*(1\d{5})(?:\s|$)"),
     re.compile(r"(?i)\border[_\-\s]*0*(1\d{5})"),
@@ -130,7 +126,6 @@ def pick_total_for_line(line: Line, sum_band: Band) -> Optional[str]:
     if not cands: return None
     tok=join_money_tokens(cands, gap_limit=8)
     if not tok: return None
-    # «1» + «027,07» → «1027,07»
     lefts=[w for w in line.words if w.x1<=cands[-1].x0+1 and (cands[-1].x0-w.x1)<=8]
     if lefts:
         lefts.sort(key=lambda w:w.x1, reverse=True)
@@ -161,9 +156,6 @@ def collect_order_marks(lines: List[Line]) -> List[OrderMark]:
     return out
 
 def nearest_order_above(marks: List[OrderMark], y: float) -> str:
-    """
-    Ближайший order сверху относительно y (или ближайший по вертикали, но не дальше 30 pt).
-    """
     prev=[m for m in marks if m.y <= y + 2]
     if prev:
         return prev[-1].value
@@ -182,7 +174,6 @@ class BaseParser:
     def parse_page(self, lines: List[Line], words: List[Word]) -> List[dict]:
         raise NotImplementedError
 
-    # Общая логика для извлечения строк по коридорам колонок
     def _extract_rows_by_bands(self, lines: List[Line], bands: List[Band]) -> List[dict]:
         B = {b.name:b for b in bands}
         orders = collect_order_marks(lines)
@@ -192,8 +183,8 @@ class BaseParser:
             m = RE_MPN_11D.search(line_text) \
                 or RE_MPN_DOT_OPT_C.search(line_text) \
                 or RE_MPN_ZF.search(line_text)
-            if not m:
-                return None
+            if not m: return None
+            # 11-цифр и dot-формат дают группу(1) — уже без 'C'
             return m.group(1) if m.lastindex else m.group(0)
 
         cand_idx=[i for i,L in enumerate(lines) if find_mpn(L.text)]
@@ -201,7 +192,7 @@ class BaseParser:
         for i in cand_idx:
             L=lines[i]
             mpn = find_mpn(L.text)
-            if not mpn:
+            if not mpn: 
                 continue
 
             # Quantity
@@ -237,7 +228,7 @@ class BaseParser:
 
             order = nearest_order_above(orders, L.y)
 
-            # если total численно совпал с qty — попробуем правую склейку
+            # если total == qty (частая путаница) — склеим правую группу
             try:
                 if abs(to_int(bestT[1]) - qty) == 0:
                     c=[w for w in L.words if in_band(w,B["Summa"]) and (RE_MONEY.fullmatch(w.text) or RE_INT.fullmatch(w.text) or RE_DEC.fullmatch(w.text))]
@@ -256,12 +247,12 @@ class BaseParser:
         return rows
 
 # ───────────────── КОНКРЕТНЫЕ ПАРСЕРЫ ─────────────────
-# 1) ZF Scandi / ZF Danmark (Sales Invoice)
+# 1) ZF Scandi / ZF Danmark
 class ZFScandiParser(BaseParser):
     NAME = "ZF Scandi (ZF Danmark)"
 
     def matches(self, lines: List[Line], words: List[Word]) -> bool:
-        head = "\n".join(L.text for L in lines[:80])
+        head = "\n".join(L.text for L in lines[:100])
         return ("Sales Invoice" in head and "ZF DANMARK" in head) or ("No. Description" in head and "Amount" in head)
 
     def detect_bands(self, lines: List[Line], words: List[Word]) -> Optional[List[Band]]:
@@ -273,7 +264,7 @@ class ZFScandiParser(BaseParser):
             xs=[(w.x0+w.x1)/2 for w in line.words if pat.search(w.text)]
             return sum(xs)/len(xs) if xs else None
 
-        for L in lines[:160]:
+        for L in lines[:200]:
             if RE_DESC.search(L.text) and RE_QTY.search(L.text) and RE_AMT.search(L.text):
                 cx_d=_centers_for(L, RE_DESC); cx_q=_centers_for(L, RE_QTY); cx_a=_centers_for(L, RE_AMT)
                 centers=[(n,c) for n,c in [("Desc",cx_d),("Qty",cx_q),("Amt",cx_a)] if c is not None]
@@ -310,19 +301,23 @@ class JapafricaParser(BaseParser):
     NAME = "Japafrica"
 
     def matches(self, lines: List[Line], words: List[Word]) -> bool:
-        head = "\n".join(L.text for L in lines[:100])
-        return ("JAPAFRICA" in head) and (("FACTURA" in head) or ("INVOICE" in head)) and ("QTY" in head and "EUR" in head)
+        head = "\n".join(L.text for L in lines[:140])
+        # Учитываем, что в Португалии «QTY» может встречаться как «QUANT»
+        has_brand = "JAPAFRICA" in head and ("FACTURA" in head or "INVOICE" in head)
+        has_qty   = ("QTY" in head) or (re.search(r"(?i)\bquant\b", head) is not None)
+        has_eur   = ("EUR" in head) or ("€" in head)
+        return has_brand and has_qty and has_eur
 
     def detect_bands(self, lines: List[Line], words: List[Word]) -> Optional[List[Band]]:
         RE_PART = re.compile(r"(?i)ref\.*\s*ª?\s*pe[cç]a|part\s*no")
         RE_QTY  = re.compile(r"(?i)\bqty\b|quant")
-        RE_EUR  = re.compile(r"(?i)\beur\b|\bamount\b|\btotal\b")
+        RE_EUR  = re.compile(r"(?i)\beur\b|€|\bamount\b|\btotal\b")
 
         def _centers_for(line: Line, pat: re.Pattern) -> Optional[float]:
             xs=[(w.x0+w.x1)/2 for w in line.words if pat.search(w.text)]
             return sum(xs)/len(xs) if xs else None
 
-        for L in lines[:180]:
+        for L in lines[:220]:
             if RE_PART.search(L.text) and RE_QTY.search(L.text) and RE_EUR.search(L.text):
                 cx_p=_centers_for(L,RE_PART); cx_q=_centers_for(L,RE_QTY); cx_e=_centers_for(L,RE_EUR)
                 centers=[(n,c) for n,c in [("Part",cx_p),("Qty",cx_q),("Eur",cx_e)] if c is not None]
@@ -349,7 +344,7 @@ class JapafricaParser(BaseParser):
         if not bands:
             return []
         rows = self._extract_rows_by_bands(lines, bands)
-        # убрать ведущую 'C' у MPN вида C81.36400-6007
+        # удалить ведущую 'C' у артикулов вида C81.36400-6007
         for r in rows:
             if r["MPN"] and isinstance(r["MPN"], str) and r["MPN"].startswith("C") and re.fullmatch(r"C\d{2}\.\d{5}-\d{3,4}", r["MPN"]):
                 r["MPN"] = r["MPN"][1:]
@@ -364,7 +359,7 @@ class FallbackParser(BaseParser):
         return sum(xs)/len(xs) if xs else None
 
     def detect_bands_lv(self, lines: List[Line], words: List[Word]) -> Optional[List[Band]]:
-        for L in lines[:120]:
+        for L in lines[:160]:
             if RE_HDR_ART_LV.search(L.text) and RE_HDR_QTY_LV.search(L.text) and RE_HDR_SUM_LV.search(L.text):
                 cx_a=self._centers_for(L,RE_HDR_ART_LV); cx_q=self._centers_for(L,RE_HDR_QTY_LV); cx_s=self._centers_for(L,RE_HDR_SUM_LV)
                 centers=[(n,c) for n,c in [("Artikuls",cx_a),("Daudz.",cx_q),("Summa",cx_s)] if c is not None]
@@ -381,7 +376,7 @@ class FallbackParser(BaseParser):
         return None
 
     def detect_bands_en(self, lines: List[Line], words: List[Word]) -> Optional[List[Band]]:
-        for L in lines[:140]:
+        for L in lines[:180]:
             if RE_HDR_PART_EN.search(L.text) and RE_HDR_QTY_EN.search(L.text) and RE_HDR_SUM_EN.search(L.text):
                 cx_p=self._centers_for(L,RE_HDR_PART_EN); cx_q=self._centers_for(L,RE_HDR_QTY_EN); cx_s=self._centers_for(L,RE_HDR_SUM_EN)
                 centers=[(n,c) for n,c in [("Part",cx_p),("Qty",cx_q),("Sum",cx_s)] if c is not None]
@@ -390,7 +385,7 @@ class FallbackParser(BaseParser):
                     bands=[]
                     for i,(n,cx) in enumerate(centers):
                         left  = (centers[i-1][1]+cx)/2 if i>0 else cx-90
-                        right = (cx+centers[i+1][1])/2 if i<len(centers)-1 else cx+180
+                        right = (cx+центers[i+1][1])/2 if i<len(centров)-1 else cx+180
                         bands.append(Band(n,left,right))
                 else:
                     continue
@@ -418,32 +413,50 @@ class FallbackParser(BaseParser):
             bands = self.fallback_bands(words)
         return self._extract_rows_by_bands(lines, bands)
 
-# ───────────────── Реестр и роутер ─────────────────
+# ───────────────── Реестр ─────────────────
 PARSERS: List[Type[BaseParser]] = [
-    ZFScandiParser,   # специфичный
-    JapafricaParser,  # специфичный
-    FallbackParser,   # общий
+    ZFScandiParser,
+    JapafricaParser,
+    FallbackParser,
 ]
 
-def parse_pdf_with_registry(pdf_bytes: bytes) -> pd.DataFrame:
+# ───────────────── Робастный роутер ─────────────────
+def parse_pdf_with_registry(pdf_bytes: bytes, show_debug: bool=False) -> pd.DataFrame:
     pages = load_words_per_page(pdf_bytes)
     all_rows=[]
-    for words in pages:
+    for p_idx, words in enumerate(pages, start=1):
         if not words: 
             continue
         lines = group_lines(words)
 
-        # выбираем первый подходящий парсер
+        if show_debug:
+            st.caption(f"Страница {p_idx}: первые строки:")
+            st.text("\n".join(L.text for L in lines[:8]))
+
         parser = None
+        # Матчинг с пер-страничной защитой
         for cls in PARSERS:
-            inst = cls()
-            if inst.matches(lines, words):
-                parser = inst
-                break
+            try:
+                inst = cls()
+                if inst.matches(lines, words):
+                    parser = inst
+                    break
+            except Exception as e:
+                if show_debug:
+                    st.warning(f"[DEBUG] matches({cls.__name__}) упал: {e}")
+                continue
         if parser is None:
             parser = FallbackParser()
 
-        all_rows.extend(parser.parse_page(lines, words))
+        # Парсинг страницы с защитой
+        try:
+            rows = parser.parse_page(lines, words)
+            all_rows.extend(rows)
+        except Exception as e:
+            if show_debug:
+                st.error(f"[DEBUG] parse_page({parser.NAME}) упал: {e}")
+                st.code(traceback.format_exc())
+            # продолжаем следующую страницу
 
     df = pd.DataFrame(all_rows).drop_duplicates(keep="last")
     if df.empty:
@@ -458,9 +471,9 @@ pdf_file = st.file_uploader("Загрузить PDF-счёт", type=["pdf"])
 tpl_file = st.file_uploader("Шаблон Excel (необязательно)", type=["xlsx"])
 
 if pdf_file:
-    pdf_bytes = pdf_file.read()  # читаем один раз
+    pdf_bytes = pdf_file.read()
     try:
-        df = parse_pdf_with_registry(pdf_bytes)
+        df = parse_pdf_with_registry(pdf_bytes, show_debug=debug)
     except Exception as e:
         st.error(f"Не удалось разобрать PDF: {e}")
         df = pd.DataFrame(columns=["MPN","Replacem","Quantity","Totalsprice","Order reference"])
@@ -468,12 +481,10 @@ if pdf_file:
     st.subheader("Предпросмотр")
     st.dataframe(df, use_container_width=True)
 
-    # CSV
     if not df.empty:
         csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
         st.download_button("⬇️ Скачать waybill.csv", data=csv_bytes, file_name="waybill.csv", mime="text/csv")
 
-    # Excel (с шаблоном или без)
     if st.button("⬇️ Скачать Excel"):
         if tpl_file:
             wb=load_workbook(tpl_file); ws=wb.active
@@ -482,14 +493,12 @@ if pdf_file:
         else:
             wb=Workbook(); ws=wb.active
             ws.append(["MPN","Replacem","Quantity","Totalsprice","Order reference"])
-
         for r in df.itertuples(index=False):
             ws.append(list(r))
-
         bio=io.BytesIO(); wb.save(bio)
         st.download_button("Скачать waybill.xlsx",
                            data=bio.getvalue(),
                            file_name="waybill.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 else:
-    st.info("Загрузите счёт — поддержаны Japafrica и ZF Scandi; остальные форматы будут разобраны Fallback-парсером.")
+    st.info("Поддержаны Japafrica и ZF Scandi. Для иных форматов используется Fallback.")
