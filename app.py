@@ -1,8 +1,8 @@
-# app.py — Waybill Maker (quiet UI; Japafrica + ZF Scandi + Fallback)
+# app.py — Waybill Maker (quiet UI; Japafrica text-only + ZF Scandi + Fallback)
 # Правки:
-#  • RE_MONEY принимает пробел/nbsp/ТОЧКУ как разделитель тысяч (ловим 3.980,89 / 6 349,20)
-#  • Japafrica: qty берём по метке QTY/QUANT/UNID как xx,xx/xx.xx (строка '26.00'); total — последняя денежная справа (6349.20)
-#  • «Последний Order nr» тянется на строки без номера (продолжение счета/страницы)
+#  • Japafrica принудительно в TEXT-режиме (qty = 'xx.xx', total = последняя денежная справа)
+#  • RE_MONEY поддерживает пробел/nbsp/ТОЧКУ как разделитель тысяч
+#  • «Последний Order nr» тянется на строки без номера
 #  • Только Excel (CSV убран)
 
 import io, re, statistics
@@ -19,31 +19,27 @@ st.set_page_config(page_title="Waybill Maker", page_icon="📦", layout="wide")
 st.title("📦 Waybill Maker")
 
 # ───────────────── Regex (общие) ─────────────────
-RE_MPN_11D        = re.compile(r"\bC?(\d{11})\b")                      # 11 цифр (опц. 'C' → убираем)
-RE_MPN_DOT_OPT_C  = re.compile(r"\bC?(\d{2}\.\d{5}-\d{3,4})\b")        # 81.36304-0019 (опц. 'C' → убираем)
-RE_MPN_ZF         = re.compile(r"\b\d{3,4}\.\d{3}\.\d{3}\b")           # 0750.117.859
+RE_MPN_11D        = re.compile(r"\bC?(\d{11})\b")
+RE_MPN_DOT_OPT_C  = re.compile(r"\bC?(\d{2}\.\d{5}-\d{3,4})\b")
+RE_MPN_ZF         = re.compile(r"\b\d{3,4}\.\d{3}\.\d{3}\b")
 
 RE_INT   = re.compile(r"^\d{1,4}$")
 RE_DEC   = re.compile(r"^\d{1,6}[.,]\d{2}$")
-# ВАЖНО: разрешаем пробел/nbsp/ТОЧКУ как разделитель тысяч.
-RE_MONEY = re.compile(r"\d{1,3}(?:[ .\u00A0]?\d{3})*[.,]\d{2}")
+RE_MONEY = re.compile(r"\d{1,3}(?:[ .\u00A0]?\d{3})*[.,]\d{2}")  # '3.980,89' / '6 349,20' / '6349,20'
 
-# LV/EN headers (для Fallback)
 RE_HDR_ART_LV = re.compile(r"(?i)artik|artikul")
 RE_HDR_QTY_LV = re.compile(r"(?i)daudz")
 RE_HDR_SUM_LV = re.compile(r"(?i)summa|summ")
 RE_HDR_PART_EN= re.compile(r"(?i)\bpart\b|ref|pe[cç]a")
 RE_HDR_QTY_EN = re.compile(r"(?i)\bqty\b|quant\.?|quantidade")
-RE_HDR_SUM_EN = re.compile(r"(?i)\beur\b|€|\bamount\b|\btotal\b|\bsum\b")
+RE_HDR_SUM_EN = re.compile(r"(?i)\beur\b|€|\bamount\b|\btotal\b")
 
-# Order reference
 RE_ORDER = [
     re.compile(r"(?:^|\s)#\s*(1\d{5})(?:\s|$)"),
     re.compile(r"(?i)\border[_\-\s]*0*(1\d{5})"),
     re.compile(r"(?<![\d.,])(1\d{5})(?![\d.,])"),
 ]
 
-# ───────────────── Utils ─────────────────
 def to_float(s: str) -> float:
     return float(s.replace("\u00A0"," ").replace(" ","").replace(".","").replace(",","."))
 
@@ -51,24 +47,18 @@ def to_int(s: str) -> int:
     return int(round(to_float(s)))
 
 def fmt_money_dot(s: Optional[str]) -> str:
-    if not s:
-        return "0.00"
+    if not s: return "0.00"
     return f"{to_float(s):.2f}"
 
 @dataclass
-class Word:
-    x0: float; y0: float; x1: float; y1: float; text: str
+class Word:  x0: float; y0: float; x1: float; y1: float; text: str
 @dataclass
-class Line:
-    y: float; words: List[Word]; text: str
+class Line:  y: float; words: List[Word]; text: str
 @dataclass
-class Band:
-    name: str; x_left: float; x_right: float
+class Band:  name: str; x_left: float; x_right: float
 @dataclass
-class OrderMark:
-    x: float; y: float; value: str
+class OrderMark: x: float; y: float; value: str
 
-# ───────────────── low-level text ─────────────────
 def load_words_per_page(pdf_bytes: bytes) -> List[List[Word]]:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     out=[]
@@ -83,7 +73,6 @@ def group_lines(words: List[Word]) -> List[Line]:
     heights=[w.y1-w.y0 for w in words if (w.y1-w.y0)>0.2]
     h = statistics.median(heights) if heights else 8.0
     ytol=max(1.2, h*0.65)
-
     res=[]; cur=[]; last=None
     for w in words:
         if last is None or abs(w.y0-last)<=ytol:
@@ -91,7 +80,6 @@ def group_lines(words: List[Word]) -> List[Line]:
         else:
             cur.sort(key=lambda t:t.x0); res.append(cur); cur=[w]; last=w.y0
     if cur: cur.sort(key=lambda t:t.x0); res.append(cur)
-
     out=[]
     for ln in res:
         y=statistics.fmean([w.y0 for w in ln])
@@ -108,18 +96,14 @@ def join_money_tokens(tokens: List[Word], gap_limit: int = 8) -> Optional[str]:
     tokens.sort(key=lambda w: w.x0)
     groups=[]; cur=[tokens[0]]
     for w in tokens[1:]:
-        if (w.x0 - cur[-1].x1) <= gap_limit:
-            cur.append(w)
-        else:
-            groups.append(cur); cur=[w]
+        if (w.x0 - cur[-1].x1) <= gap_limit: cur.append(w)
+        else: groups.append(cur); cur=[w]
     groups.append(cur)
     g = max(groups, key=lambda G: max(w.x1 for w in G))
     raw = "".join(w.text.replace("\u00A0","").replace(" ","") for w in g)
     if not re.search(r"[.,]\d{2}$", raw):
-        if re.fullmatch(r"\d{1,9}", raw):
-            raw = raw + ".00"
-        else:
-            raw = re.sub(r"(\d{2})$", r".\1", raw)
+        if re.fullmatch(r"\d{1,9}", raw): raw = raw + ".00"
+        else: raw = re.sub(r"(\d{2})$", r".\1", raw)
     return raw
 
 def pick_total_for_line(line: Line, sum_band: Band) -> Optional[str]:
@@ -127,7 +111,6 @@ def pick_total_for_line(line: Line, sum_band: Band) -> Optional[str]:
     if not cands: return None
     tok=join_money_tokens(cands, gap_limit=8)
     if not tok: return None
-    # «1» + «027,07» → «1027,07»
     lefts=[w for w in line.words if w.x1<=cands[-1].x0+1 and (cands[-1].x0-w.x1)<=8]
     if lefts:
         lefts.sort(key=lambda w:w.x1, reverse=True)
@@ -177,14 +160,13 @@ class BaseParser:
         def find_mpn(line_text: str):
             m = RE_MPN_11D.search(line_text) or RE_MPN_DOT_OPT_C.search(line_text) or RE_MPN_ZF.search(line_text)
             if not m: return None
-            return m.group(1) if m.lastindex else m.group(0)  # уже без 'C' для 11d/dot
+            return m.group(1) if m.lastindex else m.group(0)
 
         cand_idx=[i for i,L in enumerate(lines) if find_mpn(L.text)]
         for i in cand_idx:
             L=lines[i]; mpn=find_mpn(L.text)
             if not mpn: continue
 
-            # qty (коридор "Daudz.")
             best=(1e9,None)
             for d in [0,1]:
                 for sgn in (0,-1,1):
@@ -197,7 +179,6 @@ class BaseParser:
                 if best[1]: break
             qty=to_int(best[1]) if best[1] else None
 
-            # total (коридор "Summa")
             bestT=(1e9,None)
             for d in [0,1]:
                 for sgn in (0,-1,1):
@@ -213,7 +194,6 @@ class BaseParser:
             if qty is None or total is None: continue
             order=nearest_order_above(orders, L.y)
 
-            # если total == qty — попробуем правую склейку
             try:
                 if abs(to_int(bestT[1]) - qty) == 0:
                     c=[w for w in L.words if in_band(w,B["Summa"]) and (RE_MONEY.fullmatch(w.text) or RE_INT.fullmatch(w.text) or RE_DEC.fullmatch(w.text))]
@@ -224,7 +204,6 @@ class BaseParser:
         return rows
 
 # ───────────────── КОНКРЕТНЫЕ ПАРСЕРЫ ─────────────────
-# 1) ZF Scandi / ZF Danmark
 class ZFScandiParser(BaseParser):
     NAME="ZF Scandi (ZF Danmark)"
     def matches(self, lines: List[Line], words: List[Word]) -> bool:
@@ -259,11 +238,9 @@ class ZFScandiParser(BaseParser):
         bands=self.detect_bands(lines, words)
         return self._extract_rows_by_bands(lines, bands) if bands else []
 
-# 2) Japafrica (FACTURA / INVOICE)
+# ── JAPAFRICA: всегда TEXT-режим ─────────────────────
 class JapafricaParser(BaseParser):
     NAME="Japafrica"
-
-    RE_PART_HDR = re.compile(r"(?i)\b(part|ref|pe[cç]a)\b")
     RE_QTY_HDR  = re.compile(r"(?i)\b(qty|quant|unid)\b")
     RE_EUR_HDR  = re.compile(r"(?i)\b(eur)\b|€|\bamount\b|\btotal\b")
 
@@ -274,92 +251,53 @@ class JapafricaParser(BaseParser):
         has_eur  = self.RE_EUR_HDR.search(head) is not None
         return has_fact and has_qty and has_eur
 
-    def _detect_bands(self, lines: List[Line], words: List[Word]) -> Optional[List[Band]]:
-        def centers(line,pat):
-            xs=[(w.x0+w.x1)/2 for w in line.words if pat.search(w.text)]
-            return sum(xs)/len(xs) if xs else None
-        for L in lines[:220]:
-            if self.RE_PART_HDR.search(L.text) and self.RE_QTY_HDR.search(L.text) and self.RE_EUR_HDR.search(L.text):
-                cx_p, cx_q, cx_e = centers(L,self.RE_PART_HDR), centers(L,self.RE_QTY_HDR), centers(L,self.RE_EUR_HDR)
-                vals=[(n,c) for n,c in [("Part",cx_p),("Qty",cx_q),("Eur",cx_e)] if c is not None]
-                if len(vals)<2: continue
-                vals.sort(key=lambda t:t[1])
-                bands=[]
-                for i,(n,cx) in enumerate(vals):
-                    left=(vals[i-1][1]+cx)/2 if i>0 else cx-100
-                    right=(cx+vals[i+1][1])/2 if i<len(vals)-1 else cx+200
-                    bands.append(Band(n,left,right))
-                mapped=[]
-                for b in sorted(bands, key=lambda b:b.x_left):
-                    nm = "Artikuls" if b.name=="Part" else ("Daudz." if b.name=="Qty" else "Summa")
-                    mapped.append(Band(nm,b.x_left,b.x_right))
-                return mapped
-        return None
-
-    def _parse_text_mode(self, lines: List[Line]) -> List[dict]:
-        """
-        Без координат: Total = последняя денежная справа;
-        Qty = число с ДВУМЯ знаками (xx,xx/xx.xx) рядом с меткой QTY|QUANT|UNID,
-        иначе ближайшее к Total число формата \d{1,3}[.,]\d{2}.
-        """
+    def parse_page(self, lines: List[Line], words: List[Word]) -> List[dict]:
+        # TEXT-режим: Total = последняя денежная справа; Qty = xx,xx/xx.xx по метке или ближайшее к total
         rows=[]
         header_idx=None
-        pat_header=re.compile(r"(?i)\bpos\b.*\b(ref|part|pe[cç]a)\b.*\b(qty|quant|unid)\b.*\b(eur|€)\b")
+        pat_header=re.compile(r"(?i)\bpos\b.*\b(qty|quant|unid)\b.*\b(eur|€)\b")
         for i,L in enumerate(lines):
             if pat_header.search(L.text.replace("  "," ")):
                 header_idx=i; break
         start = header_idx+1 if header_idx is not None else 0
 
-        money_rx = re.compile(r"\d{1,3}(?:[ .\u00A0]?\d{3})*[.,]\d{2}")  # 6 349,20 / 6.349,20 / 6349,20
-        qty_rx_precise = re.compile(r"(?i)\b(qty|quant|unid)\D{0,12}(\d{1,3}[.,]\d{2})")
+        money_rx = RE_MONEY
+        qty_mark = re.compile(r"(?i)\b(qty|quant|unid)\D{0,12}(\d{1,3}[.,]\d{2})")
 
         for L in lines[start:]:
             txt=L.text
             m = RE_MPN_DOT_OPT_C.search(txt) or RE_MPN_11D.search(txt) or RE_MPN_ZF.search(txt)
-            if not m:
+            if not m: 
                 continue
             mpn = m.group(1) if m.lastindex else m.group(0)
 
             rest = txt[m.end():]
             moneys = list(money_rx.finditer(rest))
-            if not moneys:
+            if not moneys: 
                 continue
-            total_raw = moneys[-1].group(0)  # последняя денежная справа
+            total_raw = moneys[-1].group(0)
             total_out = fmt_money_dot(total_raw)
 
             pre = rest[:moneys[-1].start()]
-            mqty = qty_rx_precise.search(pre)
-            if mqty:
-                qty_raw = mqty.group(2)
+            mq = qty_mark.search(pre)
+            if mq:
+                qty_raw = mq.group(2)
             else:
-                candidates = list(re.finditer(r"\b(\d{1,3}[.,]\d{2})\b", pre))
-                qty_raw = candidates[-1].group(1) if candidates else None
+                cands = list(re.finditer(r"\b(\d{1,3}[.,]\d{2})\b", pre))
+                qty_raw = cands[-1].group(1) if cands else None
             if not qty_raw:
                 continue
-
-            qty_out = qty_raw.replace(",", ".")  # строка '26.00'
 
             rows.append({
                 "MPN": mpn[1:] if mpn.startswith("C") else mpn,
                 "Replacem": "",
-                "Quantity": qty_out,
+                "Quantity": qty_raw.replace(",", "."),  # '26.00'
                 "Totalsprice": total_out,
                 "Order reference": ""
             })
         return rows
 
-    def parse_page(self, lines: List[Line], words: List[Word]) -> List[dict]:
-        bands=self._detect_bands(lines, words)
-        if bands:
-            rows=self._extract_rows_by_bands(lines, bands)
-            for r in rows:
-                if isinstance(r["MPN"], str) and r["MPN"].startswith("C") and re.fullmatch(r"C\d{2}\.\d{5}-\d{3,4}", r["MPN"]):
-                    r["MPN"]=r["MPN"][1:]
-            if rows:
-                return rows
-        return self._parse_text_mode(lines)
-
-# 3) Fallback — универсальный LV/EN
+# ── Fallback ──────────────────────────
 class FallbackParser(BaseParser):
     NAME="Fallback (generic LV/EN)"
     def _centers_for(self, line: Line, pat: re.Pattern) -> Optional[float]:
@@ -410,7 +348,7 @@ class FallbackParser(BaseParser):
         if not bands: bands=self.fallback_bands(words)
         return self._extract_rows_by_bands(lines, bands)
 
-# Реестр (узкие сверху, общий — в конце)
+# Реестр парсеров
 PARSERS: List[Type[BaseParser]] = [JapafricaParser, ZFScandiParser, FallbackParser]
 
 # ───────────────── Router с «тащим Order nr» ─────────────────
@@ -422,11 +360,9 @@ def parse_pdf_with_registry(pdf_bytes: bytes) -> pd.DataFrame:
         if not words: continue
         lines=group_lines(words)
 
-        # вытащим order с этой страницы (если есть), иначе используем последний известный
         page_marks = collect_order_marks(lines)
         page_order = page_marks[-1].value if page_marks else last_seen_order
 
-        # выбор парсера
         parser=None
         for cls in PARSERS:
             try:
@@ -437,7 +373,6 @@ def parse_pdf_with_registry(pdf_bytes: bytes) -> pd.DataFrame:
                 continue
         if parser is None: parser=FallbackParser()
 
-        # парсим страницу (и подставляем page_order где пусто)
         try:
             rows=parser.parse_page(lines, words)
             if page_order:
@@ -470,7 +405,6 @@ if pdf_file:
     st.subheader("Предпросмотр")
     st.dataframe(df, use_container_width=True)
 
-    # Только Excel (CSV отключён)
     if st.button("⬇️ Скачать Excel"):
         if tpl_file:
             wb=load_workbook(tpl_file); ws=wb.active
@@ -485,4 +419,4 @@ if pdf_file:
                            file_name="waybill.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 else:
-    st.info("Загрузите счёт. Спец-парсеры: Japafrica, ZF Scandi; остальные — Fallback.")
+    st.info("Загрузите счёт. Спец-парсеры: Japafrica (text-only), ZF Scandi; остальные — Fallback.")
